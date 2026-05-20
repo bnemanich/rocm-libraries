@@ -108,7 +108,6 @@ from .SubtileGREmit import (
     graInitPointer, graTileAssignment,
     emitSingleBufferLoad, emitSubtileBufferLoad, globalReadDoSubtile,
     globalReadDTLInitCommonSgpr, globalReadLDSBufferSwap, globalReadPtrUpdates,
-    tailLoopGRNarrowBF16,
 )
 from .SubtileLREmit import (
     _emitLocalReadOffset, _emitLocalRead,

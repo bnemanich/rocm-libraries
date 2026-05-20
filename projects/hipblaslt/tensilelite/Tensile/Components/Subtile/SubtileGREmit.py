@@ -24,9 +24,8 @@ from rocisa.container import DPPModifiers, EXEC, MUBUFModifiers, VCC, vgpr, sgpr
 from rocisa.enum import RegisterType
 from rocisa.functions import vectorStaticDivide, vectorStaticRemainder
 from rocisa.instruction import (
-    BufferLoadB128, BufferLoadD16B16,
-    SAddCU32, SAddU32, SAndB32, SBranch, SCBranchSCC1, SCmpEQU32,
-    SLShiftLeftB32, SLShiftRightB32, SMovB32, SMovB64, SMulI32, SNop, SSubU32,
+    BufferLoadB128,
+    SAddCU32, SAddU32, SAndB32, SBranch, SMovB32, SMovB64, SMulI32, SNop,
     SXorB32,
     VAddU32, VAndB32, VCmpXEqU32,
     VLShiftLeftB32, VLShiftRightB32, VMovB32,
@@ -873,90 +872,6 @@ def globalReadDoSubtile(tc, writer, kernel):
       module.add(emitSubtileBufferLoad(tc, writer, kernel, [i, j]))
 
   return module
-
-def tailLoopGRNarrowBF16(writer, kernel, tc):
-  """Narrow `buffer_load_d16_b16 + lds=True` for the trailing bf16
-  element when K_remain is odd. Currently unused: `buffer_load_*_d16
-  ... lds` is not legal on gfx950; the scaffold zeros the past-K stale
-  bytes in VGPR after the local read instead. Retained for blame
-  continuity; safe to delete once the design is no longer of interest.
-  """
-  module = Module(f"tailLoopGRNarrowBF16 ({tc})")
-  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
-
-  numMIInUnroll = 8
-  bpe = 2
-  wavesize = kernel["WavefrontSize"]
-  dividerFortidInK = kernel["MatrixInstN"] * kernel["MatrixInstB"]
-
-  skipLabel = Label(
-    writer.labels.getUniqueNamePrefix(f"SubtileTailNarrowGRSkip_{tc}"),
-    comment=f"K_remain even: skip narrow {tc} trailing-element load")
-
-  with writer.allocTmpSgpr(1) as kOddInfo:
-    kOddSgpr = kOddInfo.idx
-    module.add(SAndB32(dst=sgpr(kOddSgpr), src0=sgpr("LoopCounterL"),
-                       src1=1,
-                       comment=f"{tc} narrow GR: K_odd = LoopCounterL & 1"))
-    module.add(SCmpEQU32(src0=sgpr(kOddSgpr), src1=0,
-                         comment=f"{tc} narrow GR: K_remain even ?"))
-    module.add(SCBranchSCC1(labelName=skipLabel.getLabelName(),
-                            comment=f"{tc} narrow GR: skip on even K"))
-
-  with writer.allocTmpSgpr(1) as targetTidInfo:
-    targetTidSgpr = targetTidInfo.idx
-    module.add(SSubU32(dst=sgpr(targetTidSgpr), src0=sgpr("LoopCounterL"),
-                       src1=1,
-                       comment=f"{tc} narrow GR: K_remain - 1"))
-    with writer.allocTmpSgpr(1) as offsetInfo:
-      offsetInLaneBytesSgpr = offsetInfo.idx
-      module.add(SAndB32(dst=sgpr(offsetInLaneBytesSgpr),
-                         src0=sgpr(targetTidSgpr),
-                         src1=numMIInUnroll - 1,
-                         comment=f"{tc} narrow GR: offset_within_lane = (K_remain-1) %% {numMIInUnroll}"))
-      module.add(SLShiftLeftB32(dst=sgpr(offsetInLaneBytesSgpr),
-                                shiftHex=int(math.log2(bpe)),
-                                src=sgpr(offsetInLaneBytesSgpr),
-                                comment=f"{tc} narrow GR: convert to bytes (* {bpe})"))
-      module.add(SLShiftRightB32(dst=sgpr(targetTidSgpr),
-                                 shiftHex=int(math.log2(numMIInUnroll)),
-                                 src=sgpr(targetTidSgpr),
-                                 comment=f"{tc} narrow GR: target_tidInK = (K_remain-1) >> {int(math.log2(numMIInUnroll))}"))
-
-      tidInKVgpr = writer.vgprPool.checkOut(1, "narrowGR_tidInK_%s" % tc)
-      with writer.allocTmpSgpr(1) as tmpInfo:
-        module.add(vectorStaticRemainder(
-          -1, tidInKVgpr, "Serial", wavesize, None, tmpInfo,
-          comment=f"{tc} narrow GR: lane_id = Serial %% wavesize"))
-      module.add(vectorStaticDivide(
-        tidInKVgpr, tidInKVgpr, dividerFortidInK, None,
-        comment=f"{tc} narrow GR: tidInK = lane_id / (MIN*MIB)={dividerFortidInK}"))
-
-      module.add(VCmpXEqU32(dst=EXEC(),
-                            src0=sgpr(targetTidSgpr),
-                            src1=vgpr(tidInKVgpr),
-                            comment=f"{tc} narrow GR: EXEC = (tidInK == target_tidInK)"))
-      writer.vgprPool.checkIn(tidInKVgpr)
-
-      writeBaseAddr = f"LocalWriteBaseAddr{tc}"
-      module.add(SAddU32(dst=mgpr(0), src0=sgpr(writeBaseAddr),
-                         src1=sgpr(offsetInLaneBytesSgpr),
-                         comment=f"{tc} narrow GR: m0 = LWA + offset_within_lane*bpe"))
-
-      voff = tileInfo.sharedVgprGROffset[0]
-      mubuf = MUBUFModifiers(offen=True, offset12=0, lds=True)
-      module.add(BufferLoadD16B16(
-        dst=None, vaddr=vgpr(voff),
-        saddr=sgpr(f"Srd{tc}", 4),
-        soffset=sgpr(offsetInLaneBytesSgpr),
-        mubuf=mubuf,
-        comment=f"{tc} narrow b16 trailing-element load"))
-
-  module.add(SMovB64(dst=EXEC(), src=-1,
-                     comment=f"{tc} narrow GR: restore full EXEC mask"))
-  module.add(skipLabel)
-  return module
-
 
 ##################################################
 # Subroutine to generate DTL M0 LDS buffer swap
