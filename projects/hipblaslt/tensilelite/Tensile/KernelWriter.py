@@ -35,9 +35,9 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB192, BufferLoadB32, Bu
   DSLoadU8, DSStore2B32, DSStore2B64, DSStoreB128, DSStoreB16, DSStoreB96, DSStoreB256, \
   DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB192, FlatLoadB32, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
-  MFMAInstruction, MXMFMAInstruction, SAddU32, SAddCU32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, SCmpLtU32, \
+  MFMAInstruction, MXMFMAInstruction, SAddU32, SAddCU32, SAndB32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpGeU32, SCmpLeU32, SCmpLtU32, \
   SMFMAInstruction, SNop, SEndpgm, SSetPrior, SSetRegIMM32B32, SSubBU32, SSubU32, SWaitCnt, SWaitAlu, \
-  SLongBranchPositive, VAddU32, VCmpGEI32, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VNop, Instruction
+  SLongBranchPositive, VAddU32, VCmpEQI32, VCmpGEI32, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VNop, Instruction
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
 from rocisa.functions import vectorStaticDivide, vectorStaticMultiply, vectorStaticRemainder
@@ -4310,9 +4310,133 @@ class KernelWriter(metaclass=abc.ABCMeta):
     self.vgprPool.checkIn(kPosCur)
     return module
 
-  def _emitTailLaneMaskApplySubtile(self, maskSgpr, aTile, bTile,
+  @staticmethod
+  def _subtileTailByteShiftApplies(kernel, numMIInUnroll):
+    """Gate for the sub-lane refinement: only fires when ASEM <
+    numMIInUnroll (otherwise the coarse per-lane cndmask already
+    covers every K-element past LoopCounterL) and the MX scale path
+    is inactive (MX uses its own padded-scale handling).
+    """
+    asem = kernel["AssertSummationElementMultiple"]
+    if asem >= numMIInUnroll:
+      return False
+    if kernel["ProblemType"].get("MXBlockA", 0) > 0:
+      return False
+    if kernel["ProblemType"].get("MXBlockB", 0) > 0:
+      return False
+    return True
+
+  def _emitTailByteShiftMaskSubtile(self, kernel, kPosBaseVgpr, mmak, miK,
+                                    numMIInUnroll, aTile, bTile):
+    """Sub-lane boundary refinement for bf16: zero past-LoopCounterL
+    bytes inside the boundary lane group that the coarse per-lane
+    cndmask cannot reach. Step 1 zeros each VGPR whose K-position is
+    past LoopCounterL (sufficient for even K_remain because each VGPR
+    holds 2 bf16 K-elements, so the boundary lines up). Step 2, gated
+    at runtime on `LoopCounterL & 1`, clears the hi16 of the single
+    boundary VGPR whose lo16 holds the last valid K-element. bf16-only;
+    MX is gated out by `_subtileTailByteShiftApplies`. The helper
+    name retains "ByteShift" for blame continuity with an earlier
+    `v_lshlrev_b64`-based attempt that was incorrect for this layout.
+    """
+    assert kernel["ProblemType"].get("MXBlockA", 0) == 0, (
+      "subtile tail byte refinement does not handle the MX scale path.")
+    assert kernel["ProblemType"].get("MXBlockB", 0) == 0, (
+      "subtile tail byte refinement does not handle the MX scale path.")
+
+    module = Module("tailByteRefinedMaskSubtile mmak=%u" % mmak)
+    laneSGPRCount = self.states.laneSGPRCount
+
+    # Hard-coded so accidental reuse for fp8/fp4 is loud at review time.
+    elementsPerVgpr = 2
+
+    aIndices = list(aTile.regList.indices)
+    bIndices = list(bTile.regList.indices)
+    # Sized to max so an asymmetric A/B tile shape would not silently
+    # skip the smaller side; today bf16 has aIndices == bIndices.
+    vgprPerInUnroll = max(len(aIndices), len(bIndices))
+
+    kPosCur = self.vgprPool.checkOut(1, "kPosCurByteRefine")
+    with self.allocTmpSgpr(laneSGPRCount,
+                           alignment=laneSGPRCount) as maskInfo:
+      maskSgpr = maskInfo.idx
+      for ir in range(vgprPerInUnroll):
+        kOffset = mmak * miK + ir * elementsPerVgpr
+        module.add(VAddU32(
+          dst=vgpr(kPosCur), src0=kOffset, src1=vgpr(kPosBaseVgpr),
+          comment="byteRefine[ir=%d]: K_pos = kPosBase + %d" % (ir, kOffset)))
+        module.add(VCmpGEI32(
+          dst=sgpr(maskSgpr, laneSGPRCount),
+          src0=vgpr(kPosCur), src1=sgpr("LoopCounterL"),
+          comment="byteRefine[ir=%d]: K_pos >= LoopCounterL ?" % ir))
+        for tile, tag in ((aTile, "ValuA"), (bTile, "ValuB")):
+          if ir < len(tile.regList.indices):
+            vIdx = tile.regList.indices[ir]
+            module.add(VCndMaskB32(
+              dst=vgpr(vIdx), src0=vgpr(vIdx), src1=0,
+              src2=sgpr(maskSgpr, laneSGPRCount),
+              comment="zero %s[%u] (per-VGPR byte refine)" % (tag, vIdx)))
+    self.vgprPool.checkIn(kPosCur)
+
+    # hi16 clear: only emit when ASEM permits odd K_remain.
+    if kernel["AssertSummationElementMultiple"] % 2 != 0:
+      skipLabel = Label(self.labels.getUniqueNamePrefix(
+        "SubtileTailByteHi16Skip"),
+        comment="even K_remain: skip odd-K hi16 clear")
+
+      with self.allocTmpSgpr(1) as kOddInfo:
+        kOddSgpr = kOddInfo.idx
+        module.add(SAndB32(
+          dst=sgpr(kOddSgpr), src0=sgpr("LoopCounterL"), src1=1,
+          comment="K_odd = LoopCounterL & 1"))
+        module.add(SCmpEQU32(
+          src0=sgpr(kOddSgpr), src1=0,
+          comment="K_remain even ?"))
+        module.add(SCBranchSCC1(
+          labelName=skipLabel.getLabelName(),
+          comment="skip hi16 clear on even K_remain"))
+
+      kPosHi = self.vgprPool.checkOut(1, "kPosHiByteRefine")
+      hiClearVgpr = self.vgprPool.checkOut(1, "hi16ClearTmp")
+      with self.allocTmpSgpr(laneSGPRCount,
+                             alignment=laneSGPRCount) as hiInfo:
+        hiSgpr = hiInfo.idx
+        for ir in range(vgprPerInUnroll):
+          kOffsetHi = mmak * miK + ir * elementsPerVgpr + 1
+          module.add(VAddU32(
+            dst=vgpr(kPosHi), src0=kOffsetHi, src1=vgpr(kPosBaseVgpr),
+            comment="byteHi[ir=%d]: K_pos_hi = kPosBase + %d" % (ir, kOffsetHi)))
+          module.add(VCmpGEI32(
+            dst=sgpr(hiSgpr, laneSGPRCount),
+            src0=vgpr(kPosHi), src1=sgpr("LoopCounterL"),
+            comment="byteHi[ir=%d]: K_pos_hi >= LoopCounterL ?" % ir))
+          for tile, tag in ((aTile, "ValuA"), (bTile, "ValuB")):
+            if ir < len(tile.regList.indices):
+              vIdx = tile.regList.indices[ir]
+              module.add(VAndB32(
+                dst=vgpr(hiClearVgpr), src0=hex(0xFFFF), src1=vgpr(vIdx),
+                comment="%s[%u] & 0xFFFF (hi16 -> 0)" % (tag, vIdx)))
+              module.add(VCndMaskB32(
+                dst=vgpr(vIdx), src0=vgpr(vIdx), src1=vgpr(hiClearVgpr),
+                src2=sgpr(hiSgpr, laneSGPRCount),
+                comment="zero hi16 %s[%u] (odd-K boundary VGPR)" % (tag, vIdx)))
+      self.vgprPool.checkIn(kPosHi)
+      self.vgprPool.checkIn(hiClearVgpr)
+
+      module.add(skipLabel)
+    return module
+
+  def _emitTailLaneMaskApplySubtile(self, kernel, maskSgpr, aTile, bTile,
+                                    kPosBaseVgpr, mmak, miK, numMIInUnroll,
                                     scaleAVgpr=-1, scaleBVgpr=-1):
-    """Per-MFMA cndmask chain over A/B/MXSA/MXSB inputs using maskSgpr."""
+    """Per-MFMA cndmask chain over A/B/MXSA/MXSB inputs using maskSgpr.
+
+    The coarse cndmask chain zeros lane groups whose entire K-window
+    is past `LoopCounterL` (granularity = numMIInUnroll). For bf16
+    with ASEM below that granularity, the sub-lane refinement appended
+    below additionally zeroes the boundary lane group's sub-lane
+    bytes.
+    """
     module = Module("tailLaneMaskApplySubtile")
     laneSGPRCount = self.states.laneSGPRCount
     for idx in aTile.regList.indices:
@@ -4331,6 +4455,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.add(VCndMaskB32(dst=vgpr(scaleBVgpr), src0=vgpr(scaleBVgpr), src1=0,
                              src2=sgpr(maskSgpr, laneSGPRCount),
                              comment="zero ValuMXSB[%u] if K_idx >= sizeL" % scaleBVgpr))
+
+    if self._subtileTailByteShiftApplies(kernel, numMIInUnroll):
+      module.add(self._emitTailByteShiftMaskSubtile(
+        kernel, kPosBaseVgpr, mmak, miK, numMIInUnroll, aTile, bTile))
     return module
 
 
@@ -4530,6 +4658,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.add(globalReadDoSubtile('A', self, kernel))
       module.add(globalReadDoSubtile('B', self, kernel))
 
+      # No narrow trailing-element load: `buffer_load_*_d16 ... lds`
+      # is rejected by the assembler on gfx950. Instead the wide DTL
+      # load + buffer-engine OOB suppression keeps in-bounds bytes in
+      # LDS and leaves OOB bytes stale; `_emitTailByteShiftMaskSubtile`
+      # zeros those stale bytes in VGPR after the local read.
+
       # MX scale tail GR. On gfx950 the host pads MXSA/MXSB with zeros
       # and pre-swizzles them (ContractionProblemGemm::setMXScale{A,B}
       # with padScaleTensor=true), so over-read bytes past K_tail/mxBlock
@@ -4611,7 +4745,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
                 sAsel = sBsel = -1
 
               module.add(self._emitTailLaneMaskApplySubtile(
-                  maskSgpr, atiles, btiles,
+                  kernel, maskSgpr, atiles, btiles,
+                  kPosBaseVgpr, mmak, miK, numMIInUnroll,
                   scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr))
               module.add(emitMfmaInstruction(
                   self, kernel, atiles, btiles, dtiles, dtiles,
