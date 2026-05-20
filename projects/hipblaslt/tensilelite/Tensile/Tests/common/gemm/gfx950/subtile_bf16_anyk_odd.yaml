@@ -3,7 +3,7 @@ TestParameters:
 
 #######################################################################
 # Subtile BF16 K-tail: odd K (ASEM=1). Exercises the runtime-gated
-# hi16 clear in `_emitTailByteShiftMaskSubtile` Step 2.
+# hi16 clear in `_emitTailSubLaneMaskRefineSubtile` Step 2.
 #######################################################################
 GlobalParameters:
   NumElementsToValidate: -1

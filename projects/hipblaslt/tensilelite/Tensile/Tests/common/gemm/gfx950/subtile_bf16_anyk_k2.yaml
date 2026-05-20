@@ -4,7 +4,7 @@ TestParameters:
 #######################################################################
 # Subtile BF16 K-tail: K_remain even, K_remain % 8 != 0
 # (K_remain ∈ {2, 4, 6, 10, 12, 14, 18, 22}, ASEM=2).
-# Exercises the sub-lane refinement in `_emitTailByteShiftMaskSubtile`.
+# Exercises the sub-lane refinement in `_emitTailSubLaneMaskRefineSubtile`.
 #######################################################################
 GlobalParameters:
   NumElementsToValidate: -1
