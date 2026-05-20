@@ -4353,8 +4353,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
     laneSGPRCount = self.states.laneSGPRCount
 
     # Predicate gates this code to bf16/fp16 (bpe=2), so each VGPR
-    # holds exactly 4 // 2 == 2 K-elements.
-    elementsPerVgpr = 4 // kernel["ProblemType"]["DataTypeA"].numBytes()
+    # holds 4 // 2 == 2 K-elements. Hardcoded as an int rather than
+    # `4 // bpe` because real `DataType.numBytes()` returns floats for
+    # sub-32b dtypes (bf16: `0.5 * 4 == 2.0`), and `4 // 2.0 == 2.0`
+    # would propagate floats into the rocisa kOffset arithmetic below.
+    elementsPerVgpr = 2
 
     irKeys = set(aIndicesByIr.keys()) | set(bIndicesByIr.keys())
     if not irKeys:
