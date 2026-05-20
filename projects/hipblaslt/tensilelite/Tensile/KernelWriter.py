@@ -4327,7 +4327,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     return True
 
   def _emitTailByteShiftMaskSubtile(self, kernel, kPosBaseVgpr, mmak, miK,
-                                    numMIInUnroll, aTile, bTile):
+                                    numMIInUnroll, aIndicesByIr, bIndicesByIr):
     """Sub-lane boundary refinement for bf16: zero past-LoopCounterL
     bytes inside the boundary lane group that the coarse per-lane
     cndmask cannot reach. Step 1 zeros each VGPR whose K-position is
@@ -4338,6 +4338,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
     MX is gated out by `_subtileTailByteShiftApplies`. The helper
     name retains "ByteShift" for blame continuity with an earlier
     `v_lshlrev_b64`-based attempt that was incorrect for this layout.
+
+    `aIndicesByIr` / `bIndicesByIr` are dict[int, list[int]] mapping the
+    per-tile K-slot index `ir` to the unique VGPR indices (across all
+    mma0 / mma1 tiles for this mmak) holding the bf16 K-element at
+    K-position `mmak*miK + ir*2` for A / B respectively. The deduped-
+    dict signature fits the parent's per-mmak hoisted-cndmask layout
+    where one VCmpGEI32 per K-slot covers every A/B tile at once.
     """
     assert kernel["ProblemType"].get("MXBlockA", 0) == 0, (
       "subtile tail byte refinement does not handle the MX scale path.")
@@ -4347,20 +4354,22 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module = Module("tailByteRefinedMaskSubtile mmak=%u" % mmak)
     laneSGPRCount = self.states.laneSGPRCount
 
-    # Hard-coded so accidental reuse for fp8/fp4 is loud at review time.
     elementsPerVgpr = 2
 
-    aIndices = list(aTile.regList.indices)
-    bIndices = list(bTile.regList.indices)
-    # Sized to max so an asymmetric A/B tile shape would not silently
-    # skip the smaller side; today bf16 has aIndices == bIndices.
-    vgprPerInUnroll = max(len(aIndices), len(bIndices))
+    irKeys = set(aIndicesByIr.keys()) | set(bIndicesByIr.keys())
+    if not irKeys:
+      return module
+    vgprPerInUnroll = max(irKeys) + 1
 
     kPosCur = self.vgprPool.checkOut(1, "kPosCurByteRefine")
     with self.allocTmpSgpr(laneSGPRCount,
                            alignment=laneSGPRCount) as maskInfo:
       maskSgpr = maskInfo.idx
       for ir in range(vgprPerInUnroll):
+        aIdxs = aIndicesByIr.get(ir, [])
+        bIdxs = bIndicesByIr.get(ir, [])
+        if not aIdxs and not bIdxs:
+          continue
         kOffset = mmak * miK + ir * elementsPerVgpr
         module.add(VAddU32(
           dst=vgpr(kPosCur), src0=kOffset, src1=vgpr(kPosBaseVgpr),
@@ -4369,16 +4378,18 @@ class KernelWriter(metaclass=abc.ABCMeta):
           dst=sgpr(maskSgpr, laneSGPRCount),
           src0=vgpr(kPosCur), src1=sgpr("LoopCounterL"),
           comment="byteRefine[ir=%d]: K_pos >= LoopCounterL ?" % ir))
-        for tile, tag in ((aTile, "ValuA"), (bTile, "ValuB")):
-          if ir < len(tile.regList.indices):
-            vIdx = tile.regList.indices[ir]
-            module.add(VCndMaskB32(
-              dst=vgpr(vIdx), src0=vgpr(vIdx), src1=0,
-              src2=sgpr(maskSgpr, laneSGPRCount),
-              comment="zero %s[%u] (per-VGPR byte refine)" % (tag, vIdx)))
+        for vIdx in aIdxs:
+          module.add(VCndMaskB32(
+            dst=vgpr(vIdx), src0=vgpr(vIdx), src1=0,
+            src2=sgpr(maskSgpr, laneSGPRCount),
+            comment="zero ValuA[%u] (per-VGPR byte refine)" % vIdx))
+        for vIdx in bIdxs:
+          module.add(VCndMaskB32(
+            dst=vgpr(vIdx), src0=vgpr(vIdx), src1=0,
+            src2=sgpr(maskSgpr, laneSGPRCount),
+            comment="zero ValuB[%u] (per-VGPR byte refine)" % vIdx))
     self.vgprPool.checkIn(kPosCur)
 
-    # hi16 clear: only emit when ASEM permits odd K_remain.
     if kernel["AssertSummationElementMultiple"] % 2 != 0:
       skipLabel = Label(self.labels.getUniqueNamePrefix(
         "SubtileTailByteHi16Skip"),
@@ -4402,6 +4413,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
                              alignment=laneSGPRCount) as hiInfo:
         hiSgpr = hiInfo.idx
         for ir in range(vgprPerInUnroll):
+          aIdxs = aIndicesByIr.get(ir, [])
+          bIdxs = bIndicesByIr.get(ir, [])
+          if not aIdxs and not bIdxs:
+            continue
           kOffsetHi = mmak * miK + ir * elementsPerVgpr + 1
           module.add(VAddU32(
             dst=vgpr(kPosHi), src0=kOffsetHi, src1=vgpr(kPosBaseVgpr),
@@ -4410,55 +4425,26 @@ class KernelWriter(metaclass=abc.ABCMeta):
             dst=sgpr(hiSgpr, laneSGPRCount),
             src0=vgpr(kPosHi), src1=sgpr("LoopCounterL"),
             comment="byteHi[ir=%d]: K_pos_hi >= LoopCounterL ?" % ir))
-          for tile, tag in ((aTile, "ValuA"), (bTile, "ValuB")):
-            if ir < len(tile.regList.indices):
-              vIdx = tile.regList.indices[ir]
-              module.add(VAndB32(
-                dst=vgpr(hiClearVgpr), src0=hex(0xFFFF), src1=vgpr(vIdx),
-                comment="%s[%u] & 0xFFFF (hi16 -> 0)" % (tag, vIdx)))
-              module.add(VCndMaskB32(
-                dst=vgpr(vIdx), src0=vgpr(vIdx), src1=vgpr(hiClearVgpr),
-                src2=sgpr(hiSgpr, laneSGPRCount),
-                comment="zero hi16 %s[%u] (odd-K boundary VGPR)" % (tag, vIdx)))
+          for vIdx in aIdxs:
+            module.add(VAndB32(
+              dst=vgpr(hiClearVgpr), src0=hex(0xFFFF), src1=vgpr(vIdx),
+              comment="ValuA[%u] & 0xFFFF (hi16 -> 0)" % vIdx))
+            module.add(VCndMaskB32(
+              dst=vgpr(vIdx), src0=vgpr(vIdx), src1=vgpr(hiClearVgpr),
+              src2=sgpr(hiSgpr, laneSGPRCount),
+              comment="zero hi16 ValuA[%u] (odd-K boundary VGPR)" % vIdx))
+          for vIdx in bIdxs:
+            module.add(VAndB32(
+              dst=vgpr(hiClearVgpr), src0=hex(0xFFFF), src1=vgpr(vIdx),
+              comment="ValuB[%u] & 0xFFFF (hi16 -> 0)" % vIdx))
+            module.add(VCndMaskB32(
+              dst=vgpr(vIdx), src0=vgpr(vIdx), src1=vgpr(hiClearVgpr),
+              src2=sgpr(hiSgpr, laneSGPRCount),
+              comment="zero hi16 ValuB[%u] (odd-K boundary VGPR)" % vIdx))
       self.vgprPool.checkIn(kPosHi)
       self.vgprPool.checkIn(hiClearVgpr)
 
       module.add(skipLabel)
-    return module
-
-  def _emitTailLaneMaskApplySubtile(self, kernel, maskSgpr, aTile, bTile,
-                                    kPosBaseVgpr, mmak, miK, numMIInUnroll,
-                                    scaleAVgpr=-1, scaleBVgpr=-1):
-    """Per-MFMA cndmask chain over A/B/MXSA/MXSB inputs using maskSgpr.
-
-    The coarse cndmask chain zeros lane groups whose entire K-window
-    is past `LoopCounterL` (granularity = numMIInUnroll). For bf16
-    with ASEM below that granularity, the sub-lane refinement appended
-    below additionally zeroes the boundary lane group's sub-lane
-    bytes.
-    """
-    module = Module("tailLaneMaskApplySubtile")
-    laneSGPRCount = self.states.laneSGPRCount
-    for idx in aTile.regList.indices:
-      module.add(VCndMaskB32(dst=vgpr(idx), src0=vgpr(idx), src1=0,
-                             src2=sgpr(maskSgpr, laneSGPRCount),
-                             comment="zero ValuA[%u] if K_idx >= sizeL" % idx))
-    for idx in bTile.regList.indices:
-      module.add(VCndMaskB32(dst=vgpr(idx), src0=vgpr(idx), src1=0,
-                             src2=sgpr(maskSgpr, laneSGPRCount),
-                             comment="zero ValuB[%u] if K_idx >= sizeL" % idx))
-    if scaleAVgpr >= 0:
-      module.add(VCndMaskB32(dst=vgpr(scaleAVgpr), src0=vgpr(scaleAVgpr), src1=0,
-                             src2=sgpr(maskSgpr, laneSGPRCount),
-                             comment="zero ValuMXSA[%u] if K_idx >= sizeL" % scaleAVgpr))
-    if scaleBVgpr >= 0:
-      module.add(VCndMaskB32(dst=vgpr(scaleBVgpr), src0=vgpr(scaleBVgpr), src1=0,
-                             src2=sgpr(maskSgpr, laneSGPRCount),
-                             comment="zero ValuMXSB[%u] if K_idx >= sizeL" % scaleBVgpr))
-
-    if self._subtileTailByteShiftApplies(kernel, numMIInUnroll):
-      module.add(self._emitTailByteShiftMaskSubtile(
-        kernel, kPosBaseVgpr, mmak, miK, numMIInUnroll, aTile, bTile))
     return module
 
 
@@ -4503,18 +4489,23 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, -1))
 
-      # PGR>0 tail-entry gating. Three paths keyed off origCounter:
-      #   origCounter == 0:  the SkipPreLoopGR gate in _kernelBody
-      #     skipped the entire prefetch block, so SRDs/LWAs are at
-      #     setupNewTile's defaults. NLL still ran and drained
-      #     undefined LDS into accD, so zero accD and fall through to
-      #     the lane-masked tail body.
-      #   origCounter < PGR (PGR=2 c=1 only): NGLL didn't run, so LR
-      #     stayed at buf 0 while preLoop's GR_INC flipped LWA to
-      #     buf 1. Re-XOR LWA back. SRD already at K_aligned.
-      #   origCounter >= PGR: NLL/NGLL drained K=[0, c*DU) cleanly;
-      #     last GR_INC left SRD one DU short of K_aligned. Advance
-      #     SRD by 1 DU.
+      # PGR>0 tail-entry gating. Two paths keyed off origCounter; the
+      # `origCounter == 0` case is handled upstream by the
+      # `SkipSubtileMainLoop<L>` gate in `kernelBodySubtile` (skips the
+      # entire scheduler-emitted preLoop / mainloop / NGLL / NLL block,
+      # so SRDs/LWAs stay at setupNewTile's defaults and accD stays at
+      # `initVgprTilesToZero`'s zero -- no in-tail reset needed):
+      #
+      #   0 < origCounter < PGR (PGR=2 origCounter==1 only):
+      #     SkipOp(LE 1, NLL) in the scheduler's build_preloop jumped
+      #     past GR(MT 1) into NLL, so LR (at buf 0) drained the first
+      #     prefetch correctly, but preLoop's GR_INC had already flipped
+      #     LWA to buf 1. Re-XOR LWA back so the tail's DTL write lands
+      #     in the same LDS buf the tail's LR reads from. SRD is already
+      #     at K_aligned == DU.
+      #   origCounter >= PGR:
+      #     NLL/NGLL drained K=[0, origCounter*DU) cleanly; last GR_INC
+      #     left SRD one DU short of K_aligned. Advance SRD by 1 DU.
       if kernel["PrefetchGlobalRead"] > 0:
         unrollIdx = self.states.unrollIdx
         loopChar = self.states.indexChars[
@@ -4543,22 +4534,24 @@ class KernelWriter(metaclass=abc.ABCMeta):
         if kernel["ProblemType"].get("MXBlockB", 0) > 0:
           realignTcs.append('MXSB')
 
-        c0ResetLabel = Label("PGRTailC0Reset%s" % loopChar, "")
         smallCounterLabel = Label(
           "PGRTailSmallCounterRealign%s" % loopChar, "")
         tailEntryLabel = Label("PGRTailEntry%s" % loopChar, "")
 
+        # origCounter == 0 reaches here via the SkipSubtileMainLoop<L>
+        # gate (preLoop/mainloop/NGLL/NLL were skipped). SRDs at K=0,
+        # LWAs at buf 0, accD at 0 -- branch straight to the tail body.
         module.add(SCmpEQU32(
           src0=sgpr(savedOrigCounterSgpr), src1=0,
-          comment="origCounter == 0?"))
+          comment="origCounter == 0 (mainLoop was skipped)?"))
         module.add(SCBranchSCC1(
-          labelName=c0ResetLabel.getLabelName(),
-          comment="branch to c=0 reset"))
+          labelName=tailEntryLabel.getLabelName(),
+          comment="skip realign/advance; tail body runs from setupNewTile defaults"))
 
         module.add(SCmpLtU32(
           src0=sgpr(savedOrigCounterSgpr),
           src1=pgr,
-          comment="origCounter < PGR?"))
+          comment="0 < origCounter < PGR?"))
         module.add(SCBranchSCC1(
           labelName=smallCounterLabel.getLabelName(),
           comment="branch to small-counter realign"))
@@ -4587,14 +4580,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
             src0=sgpr("LocalWriteBaseAddr%s" % tc),
             src1=sgpr("Swap%s" % tc),
             comment="XOR LWA%s back to match LR buffer" % tc))
-        module.add(SBranch(labelName=tailEntryLabel.getLabelName()))
-
-        # c=0 reset: zero accD and fall through to the lane-masked
-        # tail body. The SkipPreLoopGR gate in _kernelBody ensured no
-        # SRD advance or LWA swap fired upstream, so nothing to undo.
-        module.add(c0ResetLabel)
-        if self.states.d.tileInfo is not None:
-          module.add(initVgprTilesToZero(self, kernel, self.states.d.tileInfo))
 
         module.add(tailEntryLabel)
 
@@ -4606,15 +4591,62 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # No SRD rewind here. For PGR=0 the mainloop's per-iter GR_INC
       # leaves Srd<tc> at the K-tail's first byte after K//DU iters,
       # so the tail GR reads correct data from current SRD. For PGR>0
-      # the gating above (c=0 reset / small-counter realign / +1 DU
-      # advance) lands SRD at K_aligned. The per-MFMA lane mask below
-      # zeros lanes past LoopCounterL = K mod DU; BufferLoad bounds-
-      # clips any DU-shaped over-read.
+      # the gating above (small-counter realign / +1 DU advance) lands
+      # SRD at K_aligned -- and for `origCounter == 0` the upstream
+      # `SkipSubtileMainLoop<L>` gate kept SRD at K=0 / accD at 0. The
+      # per-MFMA lane mask below zeros lanes past
+      # LoopCounterL = K mod DU; BufferLoad bounds-clips any DU-shaped
+      # over-read.
+
+      # Allocate tail-local vgprTiles for A/B (+ MXSA/MXSB if scaled).
+      # Mainloop GR/LR goes through LogicalScheduler / InstructionEmitter
+      # using scheduler-owned vgprs; the tail reuses the legacy
+      # globalReadDoSubtile / localReadDoSubtile helpers which read
+      # tileInfo.vgprTiles directly, so we allocate a fresh range here
+      # and release it before closeLoop. D-tile vgprs are shared.
+      tailAllocTiles = [self.states.a.tileInfo, self.states.b.tileInfo]
+      if kernel["ProblemType"].get("MXBlockA", 0) > 0:
+        tailAllocTiles.append(self.states.mxsa.tileInfo)
+      if kernel["ProblemType"].get("MXBlockB", 0) > 0:
+        tailAllocTiles.append(self.states.mxsb.tileInfo)
+      for tailTile in tailAllocTiles:
+        tailTile.allocVgprTileRegisters_legacy(self, kernel)
+
+      # Re-issue one DepthU-shaped GR + LR. Byte-layout identical to a
+      # mainloop iter; lane mask below zeros lanes past K_tail.
+      #
+      # TODO(nakajee review comment 5): Tighten Srd<tc>+2 (NumRecords)
+      # at tail entry to bound-clip K-direction reads past K_rem*bpe.
+      # The buffer-NumRecords field is a single linear-byte limit, so
+      # a tight per-row K clamp is only achievable for the last M-row
+      # of the tile; the per-MFMA lane mask in the tail body remains
+      # the actual correctness mechanism for in-range M rows. Filed
+      # as a follow-up after this PR lands.
+      module.add(globalReadDoSubtile('A', self, kernel))
+      module.add(globalReadDoSubtile('B', self, kernel))
+
+      # No narrow trailing-element load: `buffer_load_*_d16 ... lds`
+      # is rejected by the assembler on gfx950. Instead the wide DTL
+      # load + buffer-engine OOB suppression keeps in-bounds bytes in
+      # LDS and leaves OOB bytes stale; `_emitTailByteShiftMaskSubtile`
+      # zeros those stale bytes in VGPR after the local read.
+
+      # MX scale tail GR. On gfx950 the host pads MXSA/MXSB with zeros
+      # and pre-swizzles them (ContractionProblemGemm::setMXScale{A,B}
+      # with padScaleTensor=true), so over-read bytes past K_tail/mxBlock
+      # are zero and contribute 0 to the MFMA. No LDS pre-zero needed.
+      if kernel["ProblemType"].get("MXBlockA", 0) > 0:
+        module.add(globalReadDoScaleSubtile('MXSA', self, kernel))
+      if kernel["ProblemType"].get("MXBlockB", 0) > 0:
+        module.add(globalReadDoScaleSubtile('MXSB', self, kernel))
 
       # Per-lane K-position base: kPosBase = tidInK * numMIInUnroll.
       # Stripped from the legacy mfmaIter setup
       # (KernelWriterAssembly.py shiftK path); subtile has
       # numReadsIterCoalesced == 1 so the kStepForCoalesced add drops.
+      # Emitted after the tail GR (and before the GR-wait) so the
+      # remainder/divide/multiply chain overlaps with the buffer-load
+      # memory latency rather than serializing in front of it.
       matrixInstT      = min(kernel["MatrixInstM"], kernel["MatrixInstN"])
       numTileInInstA   = kernel["MatrixInstM"] // matrixInstT
       numTileInInstB   = kernel["MatrixInstN"] // matrixInstT
@@ -4639,40 +4671,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
                                         tmpSgprInfo,
                                         "kPosBase = tidInK * numMIInUnroll (K-element base)"))
 
-      # Allocate tail-local vgprTiles for A/B (+ MXSA/MXSB if scaled).
-      # Mainloop GR/LR goes through LogicalScheduler / InstructionEmitter
-      # using scheduler-owned vgprs; the tail reuses the legacy
-      # globalReadDoSubtile / localReadDoSubtile helpers which read
-      # tileInfo.vgprTiles directly, so we allocate a fresh range here
-      # and release it before closeLoop. D-tile vgprs are shared.
-      tailAllocTiles = [self.states.a.tileInfo, self.states.b.tileInfo]
-      if kernel["ProblemType"].get("MXBlockA", 0) > 0:
-        tailAllocTiles.append(self.states.mxsa.tileInfo)
-      if kernel["ProblemType"].get("MXBlockB", 0) > 0:
-        tailAllocTiles.append(self.states.mxsb.tileInfo)
-      for tailTile in tailAllocTiles:
-        tailTile.allocVgprTileRegisters_legacy(self, kernel)
-
-      # Re-issue one DepthU-shaped GR + LR. Byte-layout identical to a
-      # mainloop iter; lane mask below zeros lanes past K_tail.
-      module.add(globalReadDoSubtile('A', self, kernel))
-      module.add(globalReadDoSubtile('B', self, kernel))
-
-      # No narrow trailing-element load: `buffer_load_*_d16 ... lds`
-      # is rejected by the assembler on gfx950. Instead the wide DTL
-      # load + buffer-engine OOB suppression keeps in-bounds bytes in
-      # LDS and leaves OOB bytes stale; `_emitTailByteShiftMaskSubtile`
-      # zeros those stale bytes in VGPR after the local read.
-
-      # MX scale tail GR. On gfx950 the host pads MXSA/MXSB with zeros
-      # and pre-swizzles them (ContractionProblemGemm::setMXScale{A,B}
-      # with padScaleTensor=true), so over-read bytes past K_tail/mxBlock
-      # are zero and contribute 0 to the MFMA. No LDS pre-zero needed.
-      if kernel["ProblemType"].get("MXBlockA", 0) > 0:
-        module.add(globalReadDoScaleSubtile('MXSA', self, kernel))
-      if kernel["ProblemType"].get("MXBlockB", 0) > 0:
-        module.add(globalReadDoScaleSubtile('MXSB', self, kernel))
-
       module.add(SWaitCnt(vlcnt=0, vscnt=-1,
                           comment="tail GR: wait for DTL writes to LDS"))
       module.add(SBarrier(comment="tail GR: LDS sync before LR"))
@@ -4687,9 +4685,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1,
                           comment="tail LR: wait for ds_reads before lane mask + MFMA"))
 
-      # Per-(mmak, mma1, mma0): lane mask + MFMA. Mirrors
-      # Subtile/Kernel.py:emitMfmaCode including D-tile index resolution
-      # so the masked VGPRs feed the same MFMA shape as the mainloop.
+      # Per-mmak: lane mask + MFMA. Mirrors Subtile/Kernel.py:emitMfmaCode
+      # including D-tile index resolution so the masked VGPRs feed the
+      # same MFMA shape as the mainloop.
+      #
+      # Cndmask is HOISTED out of the (mma1, mma0) MFMA grid: for a given
+      # mmak, atiles depend only on (mma0, mmak) and btiles only on
+      # (mma1, mmak), so the same A vgprs would otherwise be cndmasked
+      # `len(mma1)` times and the same B vgprs `len(mma0)` times. We
+      # emit one cndmask per unique vgpr per mmak (tracked via
+      # `seenVgpr`) and then run a cndmask-free MFMA grid.
       tiA = self.states.a.tileInfo
       tiB = self.states.b.tileInfo
       dtileInfo = self.states.d.tileInfo
@@ -4702,52 +4707,116 @@ class KernelWriter(metaclass=abc.ABCMeta):
       lrSubtileShapeB = tiB.lr.subtileShape
       miK = kernel["MatrixInstK"]
 
+      numMmaTilePerSubtileA = lrSubtileShapeA[0] * lrSubtileShapeA[1]
+      numMmaTilePerSubtileB = lrSubtileShapeB[0] * lrSubtileShapeB[1]
+      lrLocalGridA0 = tiA.localMMATileGrid[0] // lrSubtileShapeA[0]
+      lrLocalGridB0 = tiB.localMMATileGrid[0] // lrSubtileShapeB[0]
+      subtileKShape = lrSubtileShapeA[1] if hasScaleA else 0
+      subtileKGrid = tiA.localSubtileGrid[1] if hasScaleA else 0
+
+      def _aTileId(mma0_, mmak_):
+        aSId0 = mma0_ // lrSubtileShapeA[0]
+        aSId1 = mmak_ // lrSubtileShapeA[1]
+        _mmak = mmak_ % lrSubtileShapeA[1]
+        return (aSId1 * lrLocalGridA0 + aSId0) * numMmaTilePerSubtileA + _mmak
+
+      def _bTileId(mma1_, mmak_):
+        bSId0 = mma1_ // lrSubtileShapeB[0]
+        bSId1 = mmak_ // lrSubtileShapeB[1]
+        _mmak = mmak_ % lrSubtileShapeB[1]
+        return (bSId1 * lrLocalGridB0 + bSId0) * numMmaTilePerSubtileB + _mmak
+
+      def _scaleAVgpr(mma0_, mmak_):
+        scaleGroup = (mma0_ // 2) * subtileKGrid + mmak_ // subtileKShape
+        return tiMXSA.vgprTiles[MX_SCALE_TILES_PER_VGPR * scaleGroup].regList.indices[0] \
+               if hasScaleA and tiMXSA.mxBlock else -1
+
+      def _scaleBVgpr(mma1_, mmak_):
+        scaleGroup = (mma1_ // 2) * subtileKGrid + mmak_ // subtileKShape
+        return tiMXSB.vgprTiles[MX_SCALE_TILES_PER_VGPR * scaleGroup].regList.indices[0] \
+               if hasScaleB and tiMXSB.mxBlock else -1
+
       laneSGPRCount = self.states.laneSGPRCount
       for mmak in range(tiA.localMMATileGrid[1]):
-        # One mask SGPR per mmak: cmp emitted once, cndmask emitted per MFMA.
         with self.allocTmpSgpr(laneSGPRCount, alignment=laneSGPRCount) as tmpSgprInfo:
           maskSgpr = tmpSgprInfo.idx
           module.add(self._emitTailKPosCmpSubtile(kPosBaseVgpr, mmak, miK, maskSgpr))
+
+          # Hoisted lane-mask: cndmask each unique vgpr ONCE per mmak.
+          # atiles & scaleA vary only with mma0 (fixed across mma1);
+          # btiles & scaleB vary only with mma1 (fixed across mma0).
+          seenVgpr = set()
+
+          def _cndmaskVgpr(idx, label):
+            if idx < 0 or idx in seenVgpr:
+              return
+            seenVgpr.add(idx)
+            module.add(VCndMaskB32(
+                dst=vgpr(idx), src0=vgpr(idx), src1=0,
+                src2=sgpr(maskSgpr, laneSGPRCount),
+                comment="zero %s[%u] if K_idx >= sizeL" % (label, idx)))
+
+          for mma0 in range(tiA.localMMATileGrid[0]):
+            for idx in tiA.vgprTiles[_aTileId(mma0, mmak)].regList.indices:
+              _cndmaskVgpr(idx, "ValuA")
+            if hasScaleA:
+              _cndmaskVgpr(_scaleAVgpr(mma0, mmak), "ValuMXSA")
+
+          for mma1 in range(tiB.localMMATileGrid[0]):
+            for idx in tiB.vgprTiles[_bTileId(mma1, mmak)].regList.indices:
+              _cndmaskVgpr(idx, "ValuB")
+            if hasScaleB:
+              _cndmaskVgpr(_scaleBVgpr(mma1, mmak), "ValuMXSB")
+
+          # Sub-lane byte-shift refinement for bf16 with ASEM <
+          # numMIInUnroll. The coarse cndmask above zeros only whole
+          # lane groups whose entire K-window is past LoopCounterL;
+          # this helper zeros the boundary lane group's per-VGPR
+          # sub-lane bytes. Gated by `_subtileTailByteShiftApplies`
+          # (excludes the MX scale path, which uses padded scales).
+          # The helper takes deduped VGPR indices grouped by per-tile
+          # K-slot `ir` so a single VCmpGEI32 per slot covers every
+          # (mma0, mma1) tile at once, mirroring the parent's hoisted-
+          # cndmask layout.
+          if self._subtileTailByteShiftApplies(kernel, numMIInUnroll):
+            aIndicesByIr = {}
+            bIndicesByIr = {}
+            seenAByteVgpr = set()
+            seenBByteVgpr = set()
+            for mma0 in range(tiA.localMMATileGrid[0]):
+              aIndices = tiA.vgprTiles[_aTileId(mma0, mmak)].regList.indices
+              for ir, vIdx in enumerate(aIndices):
+                if vIdx in seenAByteVgpr:
+                  continue
+                seenAByteVgpr.add(vIdx)
+                aIndicesByIr.setdefault(ir, []).append(vIdx)
+            for mma1 in range(tiB.localMMATileGrid[0]):
+              bIndices = tiB.vgprTiles[_bTileId(mma1, mmak)].regList.indices
+              for ir, vIdx in enumerate(bIndices):
+                if vIdx in seenBByteVgpr:
+                  continue
+                seenBByteVgpr.add(vIdx)
+                bIndicesByIr.setdefault(ir, []).append(vIdx)
+            module.add(self._emitTailByteShiftMaskSubtile(
+                kernel, kPosBaseVgpr, mmak, miK, numMIInUnroll,
+                aIndicesByIr, bIndicesByIr))
+
+          # MFMA grid -- inputs already lane-masked above.
           for mma1 in range(tiB.localMMATileGrid[0]):
             for mma0 in range(tiA.localMMATileGrid[0]):
-              aSId0, aSId1 = mma0 // lrSubtileShapeA[0], mmak // lrSubtileShapeA[1]
-              bSId0, bSId1 = mma1 // lrSubtileShapeB[0], mmak // lrSubtileShapeB[1]
-              _mma0 = mma0 % lrSubtileShapeA[0]
-              _mma1 = mma1 % lrSubtileShapeB[0]
-              _mmak = mmak % lrSubtileShapeA[1]
-
-              numMmaTilePerSubtileA = lrSubtileShapeA[0] * lrSubtileShapeA[1]
-              numMmaTilePerSubtileB = lrSubtileShapeB[0] * lrSubtileShapeB[1]
-
-              lrLocalGridA0 = tiA.localMMATileGrid[0] // lrSubtileShapeA[0]
-              lrLocalGridB0 = tiB.localMMATileGrid[0] // lrSubtileShapeB[0]
-              atileId = (aSId1 * lrLocalGridA0 + aSId0) * numMmaTilePerSubtileA + (_mmak)
-              btileId = (bSId1 * lrLocalGridB0 + bSId0) * numMmaTilePerSubtileB + (_mmak)
-
-              atiles = tiA.vgprTiles[atileId]
-              btiles = tiB.vgprTiles[btileId]
+              atiles = tiA.vgprTiles[_aTileId(mma0, mmak)]
+              btiles = tiB.vgprTiles[_bTileId(mma1, mmak)]
               dtiles = dtileInfo.vgprTiles[mma0 + mma1 * dtileInfo.localMMATileGrid[0]]
 
               if hasScaleA:
-                subtileKShape = lrSubtileShapeA[1]
-                subtileKGrid = tiA.localSubtileGrid[1]
-                scaleGroupA = (mma0 // 2) * subtileKGrid + mmak // subtileKShape
-                scaleGroupB = (mma1 // 2) * subtileKGrid + mmak // subtileKShape
-
-                scaleAVgpr = tiMXSA.vgprTiles[MX_SCALE_TILES_PER_VGPR * scaleGroupA].regList.indices[0] if tiMXSA.mxBlock else -1
-                scaleBVgpr = tiMXSB.vgprTiles[MX_SCALE_TILES_PER_VGPR * scaleGroupB].regList.indices[0] if tiMXSB.mxBlock else -1
-
+                scaleAVgpr = _scaleAVgpr(mma0, mmak)
+                scaleBVgpr = _scaleBVgpr(mma1, mmak)
                 sAsel = (mma0 % 2) + 2 * (mmak % 2)
                 sBsel = (mma1 % 2) + 2 * (mmak % 2)
               else:
-                scaleAVgpr = -1
-                scaleBVgpr = -1
+                scaleAVgpr = scaleBVgpr = -1
                 sAsel = sBsel = -1
 
-              module.add(self._emitTailLaneMaskApplySubtile(
-                  kernel, maskSgpr, atiles, btiles,
-                  kPosBaseVgpr, mmak, miK, numMIInUnroll,
-                  scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr))
               module.add(emitMfmaInstruction(
                   self, kernel, atiles, btiles, dtiles, dtiles,
                   scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr,
@@ -4906,7 +4975,33 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if self.do["executeToPrefetchEnd"]:
       module.add(self.functionEnd(kernel, addLabel=False))
 
+    # Subtile + PGR>0: when `K // DU == 0` (`OrigLoopCounter == 0`), skip
+    # the entire scheduler-emitted preLoop / mainloop / NGLL / NLL block.
+    # `setupNewTile`'s defaults already left SRDs at K=0, LWA/LRA at
+    # buf 0, and `initVgprTilesToZero` (emitted above) zeroed accD; the
+    # scheduler would otherwise advance SRDs via the preLoop GR_INC, flip
+    # LWA via the LDS-buffer-swap, and (for PGR>=1) accumulate one
+    # bounds-clipped pass into accD via the `SkipOp(LE 1, NLL)` -> NLL
+    # path -- exactly the contamination the legacy tail scaffold had to
+    # undo via the `PGRTailC0Reset<L>` block. Gating here removes the
+    # need for that block entirely (see `_emitTailLoopScaffoldSubtile`).
+    skipSubtileMainLoopLabel = None
+    if kernel["PrefetchGlobalRead"] > 0:
+      skipLoopChar = self.states.indexChars[
+        kernel["ProblemType"]["IndicesSummation"][self.states.unrollIdx]]
+      skipSubtileMainLoopLabel = Label(
+        "SkipSubtileMainLoop%s" % skipLoopChar, "")
+      module.add(SCmpEQU32(
+        src0=sgpr("OrigLoopCounter"), src1=0,
+        comment="K//DU == 0: skip preLoop+mainloop+NGLL+NLL (tail body covers all of K)"))
+      module.add(SCBranchSCC1(
+        labelName=skipSubtileMainLoopLabel.getLabelName(),
+        comment="tail body re-issues GR+LR; no main-loop accumulation needed"))
+
     module.add(mainLoop(self, kernel))
+
+    if skipSubtileMainLoopLabel is not None:
+      module.add(skipSubtileMainLoopLabel)
 
     # Subtile K%32 tail loop. Body extracted into its own helper so the
     # unit tests can drive it without going through the full kernel emit.
@@ -5166,23 +5261,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
     packPre = [ Module() for i in range (self.states.numPackBuffer ) ]
     self.preLoopLocalWriteCode = None
 
-    # Subtile + PGR>0: skip the entire preLoop prefetch block when
-    # K // DU == 0. Without the gate the prefetch GR_INC advances SRDs
-    # and the LWA swaps toggle the LDS buffer; the tail scaffold's
-    # c=0 reset then has to undo both. Gating here keeps SRD/LWA at
-    # setupNewTile's defaults so the tail body's re-issued GR + LR
-    # runs from a known state and the c=0 reset only needs to zero accD.
-    skipPreLoopGRLabel = None
-    if kernel["UseSubtileImpl"] and kernel["PrefetchGlobalRead"] > 0:
-      skipLoopChar = self.states.indexChars[
-        kernel["ProblemType"]["IndicesSummation"][self.states.unrollIdx]]
-      skipPreLoopGRLabel = Label("SkipPreLoopGR%s" % skipLoopChar, "")
-      module.add(SCmpEQU32(
-        src0=sgpr("OrigLoopCounter"), src1=0,
-        comment="K//DU == 0: skip preLoop GR block"))
-      module.add(SCBranchSCC1(
-        labelName=skipPreLoopGRLabel.getLabelName(),
-        comment="tail body re-issues GR+LR; nothing to prefetch"))
+    # Note: the subtile + PGR>0 K//DU == 0 skip gate lives in
+    # `kernelBodySubtile` (wrapping the scheduler-emitted mainLoop)
+    # rather than here -- `UseSubtileImpl` kernels never go through
+    # this legacy `kernelBody` path. See kernelBodySubtile's
+    # `SkipSubtileMainLoop<L>` gate for the live implementation.
 
     if kernel["PrefetchGlobalRead"]:
       if self.states.doShadowInit:
@@ -5482,9 +5565,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
             module.add(packCodeB[pi])
 
       module.add(self.closeSumAtLeastUnroll(kernel, tensorParametersA, tensorParametersB, prefetch=True, isOptNLL=False, isNGLL=False))
-
-    if skipPreLoopGRLabel is not None:
-      module.add(skipPreLoopGRLabel)
 
     loopCopies = 2 if expand else 1
     isDTV = (kernel["DirectToVgprA"] or kernel["DirectToVgprB"])
