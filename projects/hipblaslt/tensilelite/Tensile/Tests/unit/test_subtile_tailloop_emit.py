@@ -505,6 +505,87 @@ class TestTailEmitContent_PGR0:
             "SkipTailLoopL must remain emitted even with NoTailLoop=True"
         assert not re.search(r"s_sub_u32.*SrdA.*K_rem", asm)
 
+    def test_emits_per_mmak_early_exit(self, bf16_pgr0_asm):
+        """After each non-final mmak the scaffold must emit
+        `s_cmp_le_u32 LoopCounterL, MIK*(mmak+1)` + `s_cbranch_scc1
+        label_SkipTailLoopL`. Once LoopCounterL is consumed by the
+        mmaks already issued, remaining mmaks operate on lanes that
+        the cndmask + sub-lane refine have already zeroed -- branching
+        past them skips wasted MFMA cycles.
+        """
+        tail = _extract_tail_section(bf16_pgr0_asm)
+        assert tail, "No tail block emitted"
+        cmpMatches = re.findall(
+            r"s_cmp_le_u32[^\n]*sgprLoopCounterL[^\n]*MIK\*\(subIterK\+1\)",
+            tail)
+        brMatches = re.findall(
+            r"s_cbranch_scc1[^\n]*label_SkipTailLoopL[^\n]*early-exit tail",
+            tail)
+        assert cmpMatches, (
+            "Tail must emit at least one per-mmak `s_cmp_le_u32 LoopCounterL, "
+            "MIK*(subIterK+1)` early-exit guard.\nTail excerpt:\n" + tail[-1500:]
+        )
+        assert len(cmpMatches) == len(brMatches), (
+            "Per-mmak early exit must pair s_cmp_le_u32 with s_cbranch_scc1; "
+            "got %d cmps vs %d branches" % (len(cmpMatches), len(brMatches))
+        )
+
+    def test_per_mmak_early_exit_threshold_progression(self, fp4_pgr0_asm):
+        """Each emitted per-mmak early exit must compare against
+        `MIK * (subIterK + 1)`, so the threshold strictly increases
+        with subIterK. Pins the formula rather than a fixed value
+        (so future tile-grid changes don't silently corrupt it).
+        """
+        tail = _extract_tail_section(fp4_pgr0_asm)
+        assert tail
+        thresholds = [int(t, 0) for t in re.findall(
+            r"s_cmp_le_u32[^\n]*sgprLoopCounterL[^\n]*,\s*(0x[0-9a-fA-F]+)"
+            r"[^\n]*MIK\*\(subIterK\+1\)", tail)]
+        assert thresholds, (
+            "Tail must emit at least one per-mmak `s_cmp_le_u32 LoopCounterL, "
+            "MIK*(subIterK+1)`"
+        )
+        miK = 128  # FP4 fixture: MatrixInstK
+        for idx, thr in enumerate(thresholds):
+            assert thr == miK * (idx + 1), (
+                "Per-mmak early-exit threshold[%u]=%#x must equal "
+                "MIK*(subIterK+1)=%#x" % (idx, thr, miK * (idx + 1))
+            )
+
+    def test_per_mmak_early_exit_omits_after_final_mmak(self, bf16_pgr0_asm):
+        """The final mmak's natural exit is the closeLoop sub +
+        single-iter zero, so emitting an early-exit after it would be
+        wasted asm. Pin that the early-exit branch count == mmak count
+        - 1 (one branch between every consecutive mmak pair, none
+        after the last).
+
+        The bf16 fixture has localMMATileGrid[1] == 2 -> exactly one
+        early-exit branch in the tail. If the production tile grid
+        changes, this pin still holds via the parameterised count.
+        """
+        tail = _extract_tail_section(bf16_pgr0_asm)
+        assert tail
+        brCount = len(re.findall(
+            r"s_cbranch_scc1[^\n]*label_SkipTailLoopL[^\n]*early-exit tail",
+            tail))
+        # bf16 fixture: MIK=32, DepthU=64 -> 2 mmak iters, so 1 exit.
+        assert brCount == 1, (
+            "bf16 fixture should emit exactly 1 per-mmak early exit "
+            "(localMMATileGrid[1]=2 -> mmak in {0,1}, exit only after "
+            "mmak=0). Got %d.\nTail excerpt:\n%s"
+            % (brCount, tail[-2000:])
+        )
+
+    def test_per_mmak_early_exit_absent_when_NoTailLoop(self):
+        """NoTailLoop=True elides the entire tail body, so no per-mmak
+        early-exit should be emitted anywhere.
+        """
+        asm = _emit_tail_loop_asm(fp4=False, no_tail_loop=True, pgr=0)
+        assert not re.search(
+            r"s_cmp_le_u32[^\n]*sgprLoopCounterL[^\n]*MIK\*\(subIterK\+1\)",
+            asm
+        ), "NoTailLoop must not emit per-mmak early exits"
+
 
 # ── Tests: PGR=2 ─────────────────────────────────────────────────────────────
 

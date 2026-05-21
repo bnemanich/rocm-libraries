@@ -4492,6 +4492,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, -1))
 
+      # loopChar drives both the PGR>0 tail-entry gating below and the
+      # per-mmak early-exit branch target (`SkipTailLoop<L>`).
+      unrollIdx = self.states.unrollIdx
+      loopChar = self.states.indexChars[
+        kernel["ProblemType"]["IndicesSummation"][unrollIdx]]
+
       # PGR>0 tail-entry gating. Two paths keyed off origCounter; the
       # `origCounter == 0` case is handled upstream by the
       # `SkipSubtileMainLoop<L>` gate in `kernelBodySubtile` (skips the
@@ -4510,9 +4516,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
       #     NLL/NGLL drained K=[0, origCounter*DU) cleanly; last GR_INC
       #     left SRD one DU short of K_aligned. Advance SRD by 1 DU.
       if kernel["PrefetchGlobalRead"] > 0:
-        unrollIdx = self.states.unrollIdx
-        loopChar = self.states.indexChars[
-          kernel["ProblemType"]["IndicesSummation"][unrollIdx]]
         pgr = kernel["PrefetchGlobalRead"]
 
         # Per-tensor SRD advance: A/B by depthUBytes (matches
@@ -4833,6 +4836,22 @@ class KernelWriter(metaclass=abc.ABCMeta):
                   scaleAsel=sAsel, scaleBsel=sBsel,
                   comment="tail MFMA C[%u,%u] += A[%u,%u] * B[%u,%u] (mmak=%u)" %
                           (mma0, mma1, mma0, mmak, mmak, mma1, mmak)))
+
+        # Per-mmak early exit: when LoopCounterL (= K mod DU = K_tail)
+        # is fully consumed by the mmaks we've already issued
+        # (K_tail <= MIK * (mmak + 1)), all subsequent (mmak+1, ...)
+        # MFMAs would feed lanes that the cndmask + sub-lane refine
+        # have already zeroed. Skip them by branching to the tail-end
+        # label. Omit after the final mmak: closeLoop's natural exit
+        # covers it.
+        if mmak + 1 < tiA.localMMATileGrid[1]:
+          consumedK = miK * (mmak + 1)
+          module.add(SCmpLeU32(
+              src0=sgpr("LoopCounterL"), src1=hex(consumedK),
+              comment="LoopCounterL <= MIK*(subIterK+1)?"))
+          module.add(SCBranchSCC1(
+              labelName=Label.getFormatting("SkipTailLoop%s" % loopChar),
+              comment="early-exit tail after subIterK=%u (no valid K left)" % mmak))
 
       for tailTile in tailAllocTiles:
         tailTile.deallocVgprTileRegisters_legacy(self, kernel)
