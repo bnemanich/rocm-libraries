@@ -22,11 +22,19 @@
 #
 # SPDX-License-Identifier: MIT
 ################################################################################
-"""Tail-loop emit content assertions for the subtile BF16 any-K tail.
+"""Tail-loop emit content assertions for the subtile any-K tail.
 
 Drives `KernelWriter._emitTailLoopScaffoldSubtile` at ASEM ∈ {32, 8,
-2, 1} via `setdefault_tail_scaffold_kernel_keys(..., asem=...)` and
-pins the K%32 / K%8 / K%2 / odd-K emit shape.
+4, 2, 1} via `setdefault_tail_scaffold_kernel_keys(..., asem=...)` and
+pins the K%32 / K%8 / K%4 / K%2 / odd-K emit shape.
+
+When the sub-lane byte refine fires (ASEM<numMIInUnroll for non-MX
+integer-bpe operands) it owns the per-lane K-tail mask end-to-end:
+the coarse `kPos vs LoopCounterL` cmp + per-VGPR cndmask is removed
+and a single per-(operand, ir) mask chain feeds a `v_and` against
+each boundary VGPR. The mask chain folds in mod = `elementsPerVgpr`-1
+down to 0 byte slots, statically skipped when `ASEM*bpe % bpr == 0`
+and runtime-gated by `LoopCounterL & (elementsPerVgpr-1)` otherwise.
 """
 import re
 
@@ -61,8 +69,9 @@ def _emit_anyk_tail_asm(*, asem: int, pgr: int = 0, MT0: int = 128, MT1: int = 1
 # ── Tests: K%8 (ASEM=8) ──────────────────────────────────────────────────────
 
 class TestAnyKEmit_K8:
-    """K%8 reuses the K32 emit path unchanged: the per-lane mask
-    granularity is already `numMIInUnroll=8` for bf16.
+    """K%8 reuses the K32 emit path unchanged: at numMIInUnroll=8 for
+    bf16 the byte refine gate (`ASEM<numMIInUnroll`) is not satisfied,
+    so the coarse per-mmak cmp + per-VGPR cndmask is the only mask.
     """
 
     def test_k8_emit_matches_k32_shape(self):
@@ -88,17 +97,90 @@ class TestAnyKEmit_K8:
             f"equal K%32 (ASEM=32) baseline {len(cnd_k32)}."
         )
 
+    def test_k8_no_byte_refine(self):
+        """ASEM=8 = numMIInUnroll → byte-refine gate must reject; no
+        `byteRefine` comments should appear.
+        """
+        tail = _extract_tail_section(_emit_anyk_tail_asm(asem=8, pgr=0))
+        assert tail
+        assert "byteRefine" not in tail, (
+            "K%8 emit must NOT engage the sub-lane byte refine "
+            "(ASEM>=numMIInUnroll → coarse mask suffices)."
+        )
+
+
+# ── Tests: K%4 (ASEM=4) ──────────────────────────────────────────────────────
+
+class TestAnyKEmit_K4:
+    """ASEM=4 fires the byte refine (4<numMIInUnroll=8) but the partial
+    mod>0 chain collapses statically because `ASEM*bpe = 8` is a
+    multiple of `bpr = 4`. Only the mod=0 step is emitted; no runtime
+    gate, no mod>0 mask byte, and the coarse cmp+cndmask is gone (#5).
+    """
+
+    def test_k4_byte_refine_mod0_only(self):
+        tail = _extract_tail_section(_emit_anyk_tail_asm(asem=4, pgr=0))
+        assert tail, "K%4 emit produced no tail block"
+
+        # Byte refine must fire.
+        assert "byteRefine" in tail, (
+            "K%4 (ASEM=4) emit must engage the sub-lane byte refine "
+            "(ASEM<numMIInUnroll)."
+        )
+        # Partial-mod chain is statically skipped: no mod>0 mask byte
+        # mov, no partial-skip label.
+        assert re.search(
+            r"v_mov_b32\s+v\d+,\s*0xffff\b[^\n]*keep mask",
+            tail, re.IGNORECASE,
+        ) is None, (
+            "K%4 emit must NOT contain a mod>0 keep-mask `0xFFFF` "
+            "mov: ASEM*bpe (=8) is a multiple of bpr (=4), so the "
+            "partial chain collapses statically."
+        )
+        assert "SubtileTailByteShiftPartialSkip" not in tail, (
+            "K%4 emit must NOT contain the partial-mod skip label "
+            "(static skip should drop it)."
+        )
+        assert re.search(
+            r"s_and_b32[^\n]*LoopCounterL[^\n]*partial-mod residue",
+            tail,
+        ) is None, (
+            "K%4 emit must NOT compute the runtime partial-mod "
+            "residue (static skip should drop it)."
+        )
+
+        # mod=0 chain still fires per (operand, ir).
+        seed_movs = re.findall(
+            r"v_mov_b32\s+v\d+,\s*0xffffffff[^\n]*mask seed = full keep",
+            tail, re.IGNORECASE,
+        )
+        assert len(seed_movs) >= 4, (
+            "K%4 emit missing per-(operand, ir) mask seed "
+            "`v_mov_b32 vMask, 0xFFFFFFFF`. Tail excerpt:\n"
+            + tail[:1500]
+        )
+        # No coarse `kPosCur = kPosBase + mmak * miK` cmp/cndmask
+        # when byte refine fires (#5).
+        assert re.search(
+            r"v_cndmask_b32[^\n]*if K_idx >= sizeL", tail
+        ) is None, (
+            "K%4 emit must NOT contain the legacy coarse "
+            "`v_cndmask_b32 ... if K_idx >= sizeL` per-VGPR cndmask "
+            "(byte refine subsumes it; #5)."
+        )
+
 
 # ── Tests: K%2 (ASEM=2) ──────────────────────────────────────────────────────
 
 class TestAnyKEmit_K2:
-    """K%2 emits the per-VGPR refinement
-    (`_emitTailSubLaneMaskRefineSubtile` Step 1) on top of the coarse
-    per-lane cndmask. Negative pins verify the helper does NOT emit a
-    `v_lshl(rev)_b64` byte-shift pattern.
+    """ASEM=2 fires the byte refine. `ASEM*bpe = 4` is a multiple of
+    `bpr = 4`, so the partial mod>0 chain is statically dropped: only
+    the mod=0 step is emitted per (operand, ir). The coarse cmp +
+    per-VGPR cndmask is removed (#5); the byte refine's mod=0 v_and
+    against each boundary VGPR is the sole K-tail mask.
     """
 
-    def test_k2_emits_per_vgpr_refinement(self):
+    def test_k2_emits_per_operand_byte_refine(self):
         asm_k32 = _emit_anyk_tail_asm(asem=32, pgr=0)
         asm_k2 = _emit_anyk_tail_asm(asem=2, pgr=0)
         tail_k2 = _extract_tail_section(asm_k2)
@@ -106,57 +188,91 @@ class TestAnyKEmit_K2:
         assert tail_k2, "K%2 emit produced no tail block"
         assert tail_k32, "K%32 baseline emit produced no tail block"
 
-        # Step-1 refinement adds per-VGPR cmps beyond the per-mmak
-        # baseline cmp. Strictly greater than the K32 cmp count is
-        # the structural fingerprint of the per-VGPR loop firing.
+        # Byte refine emits one mask chain per (operand, ir): each
+        # chain starts with `v_mov vMask, 0xFFFFFFFF` then folds the
+        # mod=0 cndmask + per-VGPR v_and. Strictly more cmps than
+        # the K%32 baseline (which only has the per-mmak coarse cmp).
         cmp_k2 = re.findall(r"v_cmp_ge_i32.*LoopCounterL", tail_k2)
         cmp_k32 = re.findall(r"v_cmp_ge_i32.*LoopCounterL", tail_k32)
         assert len(cmp_k2) > len(cmp_k32), (
-            f"K%2 emit must add per-VGPR cmps beyond the K%32 baseline; "
-            f"got cmp_k2={len(cmp_k2)} vs cmp_k32={len(cmp_k32)}."
+            f"K%2 emit must add per-(operand, ir) cmps beyond the "
+            f"K%32 baseline; got cmp_k2={len(cmp_k2)} vs "
+            f"cmp_k32={len(cmp_k32)}."
         )
 
-        # Per-VGPR cndmask src order: `v_cndmask_b32 vdst, vdst, 0,
-        # s[<lo>:<hi>]` — zero is src1, mask is the SGPR pair src2.
-        # The dst==src0 form preserves the original VGPR contents on
-        # `K_idx < sizeL` lanes and writes 0 on `K_idx >= sizeL` lanes.
-        cnd_match = re.search(
-            r"v_cndmask_b32\s+v(\d+),\s+v\1,\s+0,\s+s\[\d+:\d+\]"
-            r"[^\n]*per-VGPR byte refine",
+        # Per-(operand, ir) mask seed: `v_mov_b32 vMask, 0xFFFFFFFF`
+        # tagged with the seed comment.
+        seed_movs = re.findall(
+            r"v_mov_b32\s+v\d+,\s*0xffffffff[^\n]*mask seed = full keep",
+            tail_k2, re.IGNORECASE,
+        )
+        assert len(seed_movs) >= 4, (
+            "K%2 emit missing per-(operand, ir) mask seed "
+            "`v_mov_b32 vMask, 0xFFFFFFFF`. Tail excerpt:\n"
+            + tail_k2[:1500]
+        )
+
+        # mod=0 cndmask: src1=0 (inline) folds vMask → 0 on past-
+        # boundary lanes, leaves it at the prior chain value
+        # otherwise. Tag pinned to the comment so future commenting
+        # changes get caught.
+        mod0_cnd = re.findall(
+            r"v_cndmask_b32\s+v(\d+),\s+v\1,\s*0,\s+s\[\d+:\d+\]"
+            r"[^\n]*mod=0[^\n]*past \? 0 : prev",
             tail_k2,
         )
-        assert cnd_match, (
-            "K%2 emit missing per-VGPR `v_cndmask_b32 v<dst>, v<dst>, "
-            "0, s[<lo>:<hi>]` against a Valu byte-refine VGPR. "
-            "Refinement step 1 must zero each boundary VGPR with the "
-            "zero in src1 and the per-mmak SGPR pair in src2. Tail "
-            "excerpt:\n" + tail_k2[:1500]
+        assert mod0_cnd, (
+            "K%2 emit missing per-(operand, ir) mod=0 cndmask "
+            "`v_cndmask_b32 vMask, vMask, 0, s[<lo>:<hi>]`. Tail "
+            "excerpt:\n" + tail_k2[:2000]
+        )
+
+        # Per-VGPR mask application: `v_and_b32 vIdx, vMask, vIdx`.
+        and_a = re.search(
+            r"v_and_b32\s+v(\d+),\s+v\d+,\s+v\1"
+            r"[^\n]*apply mask to ValuA",
+            tail_k2,
+        )
+        and_b = re.search(
+            r"v_and_b32\s+v(\d+),\s+v\d+,\s+v\1"
+            r"[^\n]*apply mask to ValuB",
+            tail_k2,
+        )
+        assert and_a is not None, (
+            "K%2 emit missing per-VGPR `v_and_b32 vIdx, vMask, vIdx` "
+            "for ValuA boundary VGPR. Tail excerpt:\n" + tail_k2[:2000]
+        )
+        assert and_b is not None, (
+            "K%2 emit missing per-VGPR `v_and_b32 vIdx, vMask, vIdx` "
+            "for ValuB boundary VGPR. Tail excerpt:\n" + tail_k2[:2000]
         )
 
         # ir-th VGPR's K_pos offset must appear in the v_add chain.
-        # For vgprPerInUnroll=4 and elementsPerVgpr=2 the offsets are
-        # {0, 2, 4, 6} per mmak slice. With depthU=64 / MI_K=32 the
-        # scaffold runs 2 mmak iterations, so the offsets are
-        # {0, 2, 4, 6, 32, 34, 36, 38}. Pin both ir=1 (offset 2 for
-        # mmak=0) and the same ir on mmak=1 (offset 34) so a future
-        # change that drops the per-mmak K_pos offset is caught.
+        # For elementsPerVgpr=2 (bf16) and vgprPerInUnroll=4 the
+        # mmak=0 mod=0 offsets are {0, 2, 4, 6}; mmak=1 offsets
+        # are {32, 34, 36, 38}. Pin both ir=1 mmak=0 (=2) and
+        # ir=1 mmak=1 (=34) so a future change that drops the
+        # per-mmak K_pos offset is caught.
         kpos_offsets = re.findall(
-            r"v_add_u32\s+v\d+,\s+(\d+),\s+v\d+\s*//\s*(?:byteRefine|kPosCur|byteHi)",
+            r"v_add_u32\s+v\d+,\s+(\d+),\s+v\d+\s*//\s*byteRefine",
             tail_k2,
         )
         observed_offsets = {int(x) for x in kpos_offsets}
         assert 2 in observed_offsets, (
-            f"K%2 per-VGPR refinement missing ir=1 K_pos offset (=2) "
-            f"in kPosBase add. Observed offsets: {sorted(observed_offsets)}. "
-            f"Tail excerpt:\n{tail_k2[:1500]}"
+            f"K%2 byte refine missing ir=1 mmak=0 mod=0 K_pos "
+            f"offset (=2). Observed offsets: "
+            f"{sorted(observed_offsets)}. Tail excerpt:\n"
+            f"{tail_k2[:1500]}"
         )
         assert 34 in observed_offsets, (
-            f"K%2 per-VGPR refinement missing ir=1 mmak=1 K_pos offset "
-            f"(=34 = 1*32 + 1*2). Observed offsets: "
-            f"{sorted(observed_offsets)}. Tail excerpt:\n{tail_k2[:1500]}"
+            f"K%2 byte refine missing ir=1 mmak=1 mod=0 K_pos "
+            f"offset (=34 = 1*32 + 1*2). Observed offsets: "
+            f"{sorted(observed_offsets)}. Tail excerpt:\n"
+            f"{tail_k2[:1500]}"
         )
 
-        # Negative: byte-shift refinement must NOT be emitted.
+        # Negative: byte-shift refinement must NOT use a 64-bit lshl
+        # or compute K_remain mod 8.
         assert re.search(r"v_lsh(?:l|lrev)_b64", tail_k2) is None, (
             "K%2 emit must NOT contain v_lshl(rev)_b64."
         )
@@ -164,32 +280,56 @@ class TestAnyKEmit_K2:
             "K%2 emit must NOT compute `K_remain & 7`."
         )
 
-        # Even-ASEM (ASEM=2) negative pin: the runtime-gated hi16
-        # clear is for odd K_remain only (`ASEM % 2 != 0`). At ASEM=2
-        # the helper must NOT emit the hi16 skip-label or the hi16
-        # cndmask.
-        assert "SubtileTailByteHi16Skip" not in tail_k2, (
-            "Even ASEM (=2) emit must NOT contain the odd-K hi16 "
-            "skip label `SubtileTailByteHi16Skip`."
+        # Static partial-mod skip: ASEM=2 → ASEM*bpe=4 = bpr, so the
+        # mod>0 chain (and its skip label, runtime gate, hi mask
+        # seed) must NOT be emitted.
+        assert "SubtileTailByteShiftPartialSkip" not in tail_k2, (
+            "ASEM=2 emit must NOT contain the runtime partial-mod "
+            "skip label (static skip should drop it)."
         )
-        assert re.search(r"v_cndmask_b32[^\n]*hi16", tail_k2) is None, (
-            "Even ASEM (=2) emit must NOT contain the runtime hi16 "
-            "clear `v_cndmask_b32 ... hi16 ...`."
+        assert re.search(
+            r"v_mov_b32\s+v\d+,\s*0xffff\b[^\n]*keep mask",
+            tail_k2, re.IGNORECASE,
+        ) is None, (
+            "ASEM=2 emit must NOT contain the mod=1 `0xFFFF` keep-"
+            "mask mov (static skip should drop it)."
+        )
+
+        # #5 negative pin: the legacy coarse per-VGPR cndmask is
+        # subsumed by the byte refine's v_and when the refine fires.
+        assert re.search(
+            r"v_cndmask_b32[^\n]*if K_idx >= sizeL", tail_k2
+        ) is None, (
+            "ASEM=2 emit must NOT contain the legacy coarse "
+            "`v_cndmask_b32 ... if K_idx >= sizeL` per-VGPR cndmask "
+            "(byte refine subsumes it; #5)."
         )
 
 
 # ── Tests: K%1 (odd K, ASEM=1) ───────────────────────────────────────────────
 
 class TestAnyKEmit_K1:
-    """ASEM=1 (odd K). `buffer_load_*_d16 ... lds` is not legal on
-    gfx950, so the scaffold relies on OOB-clipped wide DTL + the
-    runtime-gated hi16 clear in `_emitTailSubLaneMaskRefineSubtile`
-    Step 2 (`s_and_b32 LoopCounterL, 1` -> branch -> seed `v_mov
-    vSeed, 0xFFFF` -> per-ir `v_cmp_ge_i32` + `v_cndmask vMask,
-    0xFFFFFFFF, vSeed, smask` + N x `v_and_b32 vIdx, vMask, vIdx`).
+    """ASEM=1 (odd K). `ASEM*bpe = 2` is not a multiple of `bpr = 4`,
+    so the mod>0 partial chain is emitted under a runtime gate
+    `s_and ..., LoopCounterL, (elementsPerVgpr-1)` per (operand, ir)
+    chain. The chain shape is:
+
+      v_mov_b32 vMask, 0xFFFFFFFF                         // mask seed
+      s_and_b32 sGate, sgprLoopCounterL, (elementsPerVgpr-1)
+      s_cmp_eq_u32 sGate, 0
+      s_cbranch_scc1 SubtileTailByteShiftPartialSkip_*
+      v_mov_b32 vSeed, 0xFFFF                             // mod=1 keep
+      v_add_u32 vKpos, mod=1 offset, kPosBase
+      v_cmp_ge_i32 sMask, vKpos, sgprLoopCounterL
+      v_cndmask_b32 vMask, vMask, vSeed, sMask
+    SubtileTailByteShiftPartialSkip_*:
+      v_add_u32 vKpos, mod=0 offset, kPosBase
+      v_cmp_ge_i32 sMask, vKpos, sgprLoopCounterL
+      v_cndmask_b32 vMask, vMask, 0, sMask
+      v_and_b32 vIdx, vMask, vIdx                         // each idx
     """
 
-    def test_k1_no_narrow_load_and_has_hi16_clear(self):
+    def test_k1_no_narrow_load_and_emits_partial_chain(self):
         asm = _emit_anyk_tail_asm(asem=1, pgr=0)
         tail = _extract_tail_section(asm)
         assert tail, "ASEM=1 emit produced no tail block"
@@ -203,109 +343,103 @@ class TestAnyKEmit_K1:
             "`buffer_load_*_d16 ... lds` is not legal on gfx950."
         )
 
-        skip_label = re.search(
-            r"label_SubtileTailByteHi16Skip", tail
+        # Runtime gate skip label.
+        assert re.search(
+            r"label_SubtileTailByteShiftPartialSkip", tail
+        ), (
+            "ASEM=1 emit missing partial-mod runtime gate skip "
+            "label `SubtileTailByteShiftPartialSkip*`."
         )
-        assert skip_label is not None, (
-            "ASEM=1 emit missing odd-K hi16 skip label "
-            "`SubtileTailByteHi16Skip`."
-        )
-
-        # Runtime K-odd gate (s_and_b32 ..., 1).
-        and_one = re.search(
-            r"s_and_b32[^\n]*\b1\b[^\n]*LoopCounterL",
-            tail,
-        ) or re.search(
-            r"s_and_b32[^\n]*LoopCounterL[^\n]*\b1\b",
+        # Runtime gate `s_and ..., LoopCounterL, 0x1` (elementsPerVgpr=2).
+        gate_match = re.search(
+            r"s_and_b32[^\n]*LoopCounterL[^\n]*0x1"
+            r"[^\n]*partial-mod residue",
             tail,
         )
-        assert and_one is not None, (
-            "ASEM=1 emit missing `s_and_b32 ..., LoopCounterL, 1` "
-            "(K_remain & 1 gate). Tail excerpt:\n" + tail[:2000]
+        assert gate_match is not None, (
+            "ASEM=1 emit missing `s_and_b32 sGate, "
+            "sgprLoopCounterL, 0x1` partial-mod residue gate. "
+            "Tail excerpt:\n" + tail[:2000]
         )
 
-        # Mask seed: `v_mov_b32 vSeed, 0xFFFF` outside the per-ir
-        # loop, carrying the past-boundary mask value. Emitted once
-        # per `_emitTailSubLaneMaskRefineSubtile` call (i.e. once
-        # per mmak slice). Required because the `v_cndmask_b32_e64`
-        # src1 slot on gfx950 does not accept a 32-bit literal —
-        # only inline constants / VGPR / SGPR are legal there.
-        seed_movs = re.findall(
-            r"v_mov_b32\s+v\d+,\s+0xffff"
-            r"[^\n]*hi16 mask seed",
+        # Per-mod=1 keep-mask seed `v_mov_b32 vSeed, 0xFFFF`.
+        keep_mod1 = re.findall(
+            r"v_mov_b32\s+v\d+,\s*0xffff\b[^\n]*mod=1[^\n]*keep mask",
+            tail, re.IGNORECASE,
+        )
+        assert len(keep_mod1) >= 1, (
+            "ASEM=1 emit missing mod=1 keep-mask `v_mov_b32 vSeed, "
+            "0xFFFF`. Tail excerpt:\n" + tail[:2000]
+        )
+
+        # mod=1 cndmask: `vMask = past ? vSeed : prev` →
+        # `v_cndmask_b32 vMask, vMask, vSeed, sMask`.
+        mod1_cnd = re.search(
+            r"v_cndmask_b32\s+v(\d+),\s+v\1,\s+v\d+,\s+s\[\d+:\d+\]"
+            r"[^\n]*mod=1[^\n]*past \? 0xFFFF : prev",
             tail,
-            re.IGNORECASE,
         )
-        assert len(seed_movs) >= 1, (
-            "ASEM=1 emit missing `v_mov_b32 vSeed, 0xFFFF` hi16 "
-            "mask seed. The seed must be hoisted outside the per-ir "
-            "loop because the v_cndmask src1 cannot hold a 32-bit "
-            "literal. Tail excerpt:\n" + tail[:2000]
+        assert mod1_cnd is not None, (
+            "ASEM=1 emit missing mod=1 cndmask `v_cndmask_b32 "
+            "vMask, vMask, vSeed, s[<lo>:<hi>]` (the past-mod=1 "
+            "selector). Tail excerpt:\n" + tail[:2000]
         )
 
-        # Per-ir hi16 mask select: at least one `v_cndmask_b32
-        # vMask, 0xFFFFFFFF, vSeed, s[<lo>:<hi>]` per `v_cmp` group.
-        # 0xFFFFFFFF (= inline -1) in src0 selects on in-range
-        # lanes (identity); vSeed in src1 selects 0xFFFF on past-
-        # boundary lanes (zeroes hi16 under the following v_and).
-        # This is the structural fingerprint of the optimized form
-        # (one cndmask + N v_ands replacing N cndmasks + N v_ands).
-        cnd_mask_select = re.findall(
-            r"v_cndmask_b32\s+v\d+,\s+0xffffffff,\s+v\d+,\s+s\[\d+:\d+\]"
-            r"[^\n]*hi16 mask",
+        # mod=0 cndmask: `vMask = past ? 0 : prev`.
+        mod0_cnd = re.search(
+            r"v_cndmask_b32\s+v(\d+),\s+v\1,\s*0,\s+s\[\d+:\d+\]"
+            r"[^\n]*mod=0[^\n]*past \? 0 : prev",
             tail,
-            re.IGNORECASE,
         )
-        assert len(cnd_mask_select) >= 1, (
-            "ASEM=1 emit missing `v_cndmask_b32 vMask, 0xFFFFFFFF, "
-            "vSeed, s[<lo>:<hi>]` per-ir mask-select. Tail "
-            "excerpt:\n" + tail[:2000]
+        assert mod0_cnd is not None, (
+            "ASEM=1 emit missing mod=0 cndmask `v_cndmask_b32 "
+            "vMask, vMask, 0, s[<lo>:<hi>]`. Tail excerpt:\n"
+            + tail[:2000]
         )
 
-        # Per-VGPR hi16 clear: `v_and_b32 vIdx, vMask, vIdx` — the
-        # mask vreg is src0 and the boundary VGPR is both dst and
-        # src1. dst==src1 lets the AND zero hi16 in place on
-        # past-boundary lanes and acts as identity on in-range
-        # lanes (vMask=0xFFFFFFFF). Must be present for both ValuA
-        # and ValuB boundary VGPRs.
-        and_hi_a = re.search(
+        # Per-VGPR mask application for both ValuA and ValuB.
+        and_a = re.search(
             r"v_and_b32\s+v(\d+),\s+v\d+,\s+v\1"
-            r"[^\n]*zero hi16 ValuA",
+            r"[^\n]*apply mask to ValuA",
             tail,
         )
-        assert and_hi_a is not None, (
-            "ASEM=1 emit missing `v_and_b32 v<idx>, v<mask>, v<idx>` "
-            "(zero hi16 ValuA[..]) per-VGPR hi16 clear. Tail "
-            "excerpt:\n" + tail[:2000]
-        )
-        and_hi_b = re.search(
+        and_b = re.search(
             r"v_and_b32\s+v(\d+),\s+v\d+,\s+v\1"
-            r"[^\n]*zero hi16 ValuB",
+            r"[^\n]*apply mask to ValuB",
             tail,
         )
-        assert and_hi_b is not None, (
-            "ASEM=1 emit missing `v_and_b32 v<idx>, v<mask>, v<idx>` "
-            "(zero hi16 ValuB[..]) per-VGPR hi16 clear. Tail "
-            "excerpt:\n" + tail[:2000]
+        assert and_a is not None, (
+            "ASEM=1 emit missing `v_and_b32 vIdx, vMask, vIdx` "
+            "(apply mask to ValuA[..]) per-VGPR mask application. "
+            "Tail excerpt:\n" + tail[:2000]
+        )
+        assert and_b is not None, (
+            "ASEM=1 emit missing `v_and_b32 vIdx, vMask, vIdx` "
+            "(apply mask to ValuB[..]) per-VGPR mask application. "
+            "Tail excerpt:\n" + tail[:2000]
         )
 
-        # Negative pin on the legacy shape. The old form had a
-        # `v_and_b32 vTmp, 0xFFFF, vIdx` step per boundary VGPR
-        # (comment-tagged `0xFFFF (hi16 -> 0)`) followed by a
-        # `v_cndmask_b32 vIdx, vIdx, vTmp, s[..]` (comment-tagged
-        # `hi16 Valu...`). The optimized form keeps no inline
-        # 0xFFFF literal in any v_and, and emits no per-VGPR
-        # cndmask in the hi16 region.
+        # #5 negative pin: the legacy coarse per-VGPR cndmask is
+        # subsumed by the byte refine's v_and when the refine fires.
+        assert re.search(
+            r"v_cndmask_b32[^\n]*if K_idx >= sizeL", tail
+        ) is None, (
+            "ASEM=1 emit must NOT contain the legacy coarse "
+            "`v_cndmask_b32 ... if K_idx >= sizeL` per-VGPR "
+            "cndmask (byte refine subsumes it; #5)."
+        )
+
+        # Negative: legacy hi16 step (yesterday's intermediate
+        # shape) must not be present.
         legacy_and_ffff = re.search(
-            r"v_and_b32\s+v\d+,\s+0xffff,\s+v\d+"
+            r"v_and_b32\s+v\d+,\s*0xffff,\s+v\d+"
             r"[^\n]*hi16 -> 0",
-            tail,
-            re.IGNORECASE,
+            tail, re.IGNORECASE,
         )
         assert legacy_and_ffff is None, (
             "ASEM=1 emit must NOT contain the legacy per-VGPR "
             "`v_and_b32 v<tmp>, 0xFFFF, v<idx>  // ... hi16 -> 0` "
-            "step (replaced by per-ir mask-select + per-VGPR v_and)."
+            "step (replaced by per-(operand, ir) mask chain)."
         )
         legacy_cnd_hi_per_vgpr = re.search(
             r"v_cndmask_b32\s+v(\d+),\s+v\1,\s+v\d+,\s+s\[\d+:\d+\]"
@@ -315,8 +449,16 @@ class TestAnyKEmit_K1:
         assert legacy_cnd_hi_per_vgpr is None, (
             "ASEM=1 emit must NOT contain the legacy per-VGPR "
             "`v_cndmask_b32 v<idx>, v<idx>, v<tmp>, s[..]` for hi16 "
-            "clear (replaced by per-VGPR `v_and_b32 v<idx>, "
-            "v<mask>, v<idx>`)."
+            "clear (replaced by per-(operand, ir) mask chain)."
+        )
+
+        # Negative: the prior helper's `SubtileTailByteHi16Skip`
+        # label is gone — its purpose is owned by the unified
+        # `SubtileTailByteShiftPartialSkip` runtime gate.
+        assert "SubtileTailByteHi16Skip" not in tail, (
+            "ASEM=1 emit must NOT contain the legacy "
+            "`SubtileTailByteHi16Skip` label (the unified mask "
+            "chain uses `SubtileTailByteShiftPartialSkip` instead)."
         )
 
 
@@ -400,29 +542,41 @@ def _build_predicate_kernel(*, asem, mxa, mxb, bpeA, bpeB):
     }
 
 
-# bpeA / bpeB legend: bf16/fp16 = 2, mxfp8/int8 = 1, mxfp4 = 0.5.
+# bpeA / bpeB legend: bf16/fp16 = 2, mxfp8/int8 = 1, mxfp4 = 0.5,
+# fp32 = 4. The relaxed gate accepts any operand pair with integer
+# bpe in [1, bpr]; sub-byte (mxfp4: 0.5) and >register (>4) are out.
 @pytest.mark.parametrize(
     "asem,numMIInUnroll,mxa,mxb,bpeA,bpeB,expected",
     [
-        # Inside the asem<numMIInUnroll window, no MX, BPE=2: True.
-        (4,  8, 0,  0, 2,   2,   True),    # bf16
-        (4,  8, 0,  0, 2,   2,   True),    # fp16 (also bpe=2)
+        # Inside the asem<numMIInUnroll window, no MX, integer bpe.
+        (4,  8, 0,  0, 2,   2,   True),    # bf16 / fp16 (homogeneous)
+        (4,  8, 0,  0, 1,   1,   True),    # int8/fp8 (homogeneous; #3
+                                            # gate now accepts integer bpe)
+        (4,  8, 0,  0, 2,   1,   True),    # mixed bf16/fp8 (#3 enables
+                                            # per-operand handling)
+        (4,  8, 0,  0, 4,   4,   True),    # fp32 (1 element/VGPR);
+                                            # mod=0-only chain is valid
         # MX path: predicate must reject regardless of asem/bpe.
         (4, 32, 32, 0, 1,   2,   False),   # mxfp8 A
         (4, 32, 0, 32, 2,   0.5, False),   # mxfp4 B
         # asem >= numMIInUnroll: coarse mask covers everything.
         (8,  8, 0,  0, 2,   2,   False),
         (32, 8, 0,  0, 2,   2,   False),
-        # Non-2-byte dtypes: helper layout (`elementsPerVgpr=2`) does
-        # not apply; predicate must reject.
-        (4,  8, 0,  0, 1,   1,   False),   # int8 A and B
-        (4,  8, 0,  0, 2,   1,   False),   # mixed bpeB != 2
+        # Sub-byte / non-integer bpe: helper assumes byte-aligned mod
+        # boundaries, so mxfp4 (numBytes=0.5) must be rejected.
+        (4,  8, 0,  0, 0.5, 0.5, False),
+        (4,  8, 0,  0, 2,   0.5, False),   # mixed bf16 / mxfp4
     ],
 )
 def test_subtile_tail_byte_shift_applies_predicate(
     asem, numMIInUnroll, mxa, mxb, bpeA, bpeB, expected
 ):
-    """Pin the predicate's truth table across asem / MX / dtype."""
+    """Pin the predicate's truth table across asem / MX / dtype.
+
+    The gate now accepts any non-MX operand pair with integer bpe in
+    `[1, bpr]` so the helper can fire on fp8/int8/fp16/bf16/fp32; only
+    the MX path and ASEM>=numMIInUnroll force a False.
+    """
     from Tensile.KernelWriter import KernelWriter
 
     kernel = _build_predicate_kernel(

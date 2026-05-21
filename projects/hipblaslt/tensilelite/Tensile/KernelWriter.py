@@ -4317,9 +4317,14 @@ class KernelWriter(metaclass=abc.ABCMeta):
     Returns True when the helper should run: ASEM < numMIInUnroll
     (otherwise the coarse per-lane cndmask already covers every
     K-element past LoopCounterL), the MX scale path is inactive
-    (MX uses its own padded-scale handling), and both A/B element
-    types are 2 bytes (the helper's per-VGPR layout assumes
-    `elementsPerVgpr = 4 // bpe == 2`, i.e. bf16/fp16).
+    (MX uses its own padded-scale handling), and each operand has
+    an integer-yielding `bpe` of at least 1 byte and at most one
+    register width (so `elementsPerVgpr = max(1, bpr // bpe) >= 1`
+    is well-defined). The helper itself is bpe-parametric so this
+    gate can be relaxed in a follow-up to enable fp8/MX-data tails;
+    the integer-bpe constraint excludes mxfp4 (numBytes=0.5) for
+    now since the byte-mask construction assumes byte-aligned mod
+    boundaries.
     """
     asem = kernel["AssertSummationElementMultiple"]
     if asem >= numMIInUnroll:
@@ -4328,21 +4333,50 @@ class KernelWriter(metaclass=abc.ABCMeta):
       return False
     if kernel["ProblemType"].get("MXBlockB", 0) > 0:
       return False
-    if kernel["ProblemType"]["DataTypeA"].numBytes() != 2:
-      return False
-    if kernel["ProblemType"]["DataTypeB"].numBytes() != 2:
-      return False
+    bpr = 4
+    for tc in ("DataTypeA", "DataTypeB"):
+      bpeRaw = kernel["ProblemType"][tc].numBytes()
+      if int(bpeRaw) != bpeRaw:
+        return False
+      bpe = int(bpeRaw)
+      if bpe < 1 or bpe > bpr:
+        return False
     return True
 
   def _emitTailSubLaneMaskRefineSubtile(self, kernel, kPosBaseVgpr, mmak, miK,
                                         numMIInUnroll, aIndicesByIr, bIndicesByIr):
-    """Sub-lane K-tail mask refinement for bf16/fp16. Zeros
-    past-LoopCounterL bytes inside the boundary lane group that the
-    coarse per-lane cndmask cannot reach: step 1 zeros each VGPR
-    whose K-position is past LoopCounterL; step 2 (runtime-gated on
-    `LoopCounterL & 1`) clears the hi16 of the boundary VGPR whose
-    lo16 holds the last valid K-element. Gated by
-    `_subtileTailByteShiftApplies`.
+    """Sub-lane K-tail mask refinement: zero past-LoopCounterL bytes
+    within each per-VGPR K-window for the boundary lane group that
+    the coarse per-lane cndmask cannot reach.
+
+    For each operand and each ir slot, builds a single per-lane
+    32-bit `maskVgpr` by chaining mod=elementsPerVgpr-1 down to
+    mod=0 mask-byte selects, then `v_and`s the accumulated mask
+    against every boundary VGPR at that ir. The mod=k mask byte
+    is `(1 << (k * bpe * 8)) - 1` (keeps the lo `k` elements within
+    the VGPR when the K-position at byte offset `k * bpe` is past
+    LoopCounterL):
+
+      bf16 (bpe=2, elementsPerVgpr=2): {mod=1: 0xFFFF, mod=0: 0}
+      fp8  (bpe=1, elementsPerVgpr=4): {mod=3: 0x00FFFFFF,
+                                        mod=2: 0x0000FFFF,
+                                        mod=1: 0x000000FF,
+                                        mod=0: 0}
+
+    Static skip: when `ASEM*bpe % bpr == 0` (K_remain in bytes is a
+    multiple of a register), only the mod=0 step is reachable and
+    the mod>0 chain collapses. Runtime gate: when not statically
+    skippable, an `s_and ..., LoopCounterL, (elementsPerVgpr-1)`
+    test branches around the mod>0 chain when K_remain happens to
+    align at runtime. The mod=0 step is always emitted (it's the
+    "this VGPR is entirely past LoopCounterL" case the coarse
+    cndmask used to handle and that #5 lets the byte refine own).
+
+    A and B operand chains are emitted independently per #3 so a
+    mixed-bpe problem (e.g. asymmetric fp8/bf16 in a future PR) gets
+    correct per-operand mod chains; in the same-bpe (bf16/bf16)
+    common case the cmps do duplicate per ir but the helper stays
+    bpe-agnostic. Gated by `_subtileTailByteShiftApplies`.
     """
     assert kernel["ProblemType"].get("MXBlockA", 0) == 0, (
       "sub-lane K-tail mask refinement does not handle the MX scale path.")
@@ -4352,12 +4386,26 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module = Module("tailSubLaneMaskRefineSubtile mmak=%u" % mmak)
     laneSGPRCount = self.states.laneSGPRCount
 
-    # Predicate gates this code to bf16/fp16 (bpe=2), so each VGPR
-    # holds 4 // 2 == 2 K-elements. Hardcoded as an int rather than
-    # `4 // bpe` because real `DataType.numBytes()` returns floats for
-    # sub-32b dtypes (bf16: `0.5 * 4 == 2.0`), and `4 // 2.0 == 2.0`
-    # would propagate floats into the rocisa kOffset arithmetic below.
-    elementsPerVgpr = 2
+    # bpr = bytes per register. `DataType.numBytes()` returns float
+    # for sub-32b dtypes (bf16/fp16: 2.0, fp8: 1.0, mxfp4: 0.5) so
+    # round-trip through int and assert integrality before deriving
+    # mask widths -- a non-integer bpe would propagate floats into
+    # rocisa arithmetic below, and the predicate gate already
+    # rejects mxfp4 / future sub-byte dtypes upstream.
+    bpr = 4
+    bpeARaw = kernel["ProblemType"]["DataTypeA"].numBytes()
+    bpeBRaw = kernel["ProblemType"]["DataTypeB"].numBytes()
+    bpeA = int(bpeARaw)
+    bpeB = int(bpeBRaw)
+    assert bpeA == bpeARaw and 1 <= bpeA <= bpr, (
+      "sub-lane refine: DataTypeA bpe must be integer in [1, bpr]; "
+      "got %r" % (bpeARaw,))
+    assert bpeB == bpeBRaw and 1 <= bpeB <= bpr, (
+      "sub-lane refine: DataTypeB bpe must be integer in [1, bpr]; "
+      "got %r" % (bpeBRaw,))
+    elementsPerVgprA = max(1, bpr // bpeA)
+    elementsPerVgprB = max(1, bpr // bpeB)
+    asem = kernel["AssertSummationElementMultiple"]
 
     irKeys = set(aIndicesByIr.keys()) | set(bIndicesByIr.keys())
     if not irKeys:
@@ -4365,98 +4413,111 @@ class KernelWriter(metaclass=abc.ABCMeta):
     vgprPerInUnroll = max(irKeys) + 1
 
     kPosCur = self.vgprPool.checkOut(1, "kPosCurByteRefine")
-    with self.allocTmpSgpr(laneSGPRCount,
-                           alignment=laneSGPRCount) as maskInfo:
-      maskSgpr = maskInfo.idx
-      for ir in range(vgprPerInUnroll):
-        aIdxs = aIndicesByIr.get(ir, [])
-        bIdxs = bIndicesByIr.get(ir, [])
-        if not aIdxs and not bIdxs:
-          continue
-        kOffset = mmak * miK + ir * elementsPerVgpr
-        module.add(VAddU32(
-          dst=vgpr(kPosCur), src0=kOffset, src1=vgpr(kPosBaseVgpr),
-          comment="byteRefine[ir=%d]: K_pos = kPosBase + %d" % (ir, kOffset)))
+    maskVgpr = self.vgprPool.checkOut(1, "subLaneByteMask")
+    seedVgpr = self.vgprPool.checkOut(1, "subLaneByteSeed")
+
+    def _emitChain(operand, idxs, ir, bpe, elementsPerVgpr):
+      """Emit one (ir, operand) mask chain and v_and the accumulated
+      mask into each boundary VGPR.
+      """
+      staticSkipPartial = (asem * bpe) % bpr == 0
+      module.add(VMovB32(
+        dst=vgpr(maskVgpr), src=hex(0xFFFFFFFF),
+        comment="byteRefine[%s ir=%d mmak=%d]: mask seed = full keep"
+                % (operand, ir, mmak)))
+      partialSkipLabel = None
+      if not staticSkipPartial:
+        partialSkipLabel = Label(self.labels.getUniqueNamePrefix(
+          "SubtileTailByteShiftPartialSkip"),
+          comment="K_remain partial-mod aligned: skip mod>0 mask chain")
+        with self.allocTmpSgpr(1) as gateInfo:
+          gateSgpr = gateInfo.idx
+          module.add(SAndB32(
+            dst=sgpr(gateSgpr), src0=sgpr("LoopCounterL"),
+            src1=hex(elementsPerVgpr - 1),
+            comment="LoopCounterL & (elementsPerVgpr-1) = partial-mod residue"))
+          module.add(SCmpEQU32(
+            src0=sgpr(gateSgpr), src1=0,
+            comment="K_remain partial-mod aligned ?"))
+          module.add(SCBranchSCC1(
+            labelName=partialSkipLabel.getLabelName(),
+            comment="skip mod>0 chain on aligned K_remain"))
+        with self.allocTmpSgpr(laneSGPRCount,
+                               alignment=laneSGPRCount) as maskInfo:
+          maskSgpr = maskInfo.idx
+          # mod = elementsPerVgpr-1 down to 1: each step folds the
+          # mask down to `(1 << (mod*bpe*8)) - 1` on past-boundary
+          # lanes, leaving in-range lanes unchanged. The mod=0 step
+          # below is statically reachable so it lives outside this
+          # runtime-gated block.
+          for mod in range(elementsPerVgpr - 1, 0, -1):
+            maskByte = (1 << (mod * bpe * 8)) - 1
+            # The past-boundary mask byte lives in src1 of cndmask,
+            # which on gfx950 cannot hold a 32-bit literal -- stage
+            # it through a VGPR seed.
+            module.add(VMovB32(
+              dst=vgpr(seedVgpr), src=hex(maskByte),
+              comment="byteRefine[%s ir=%d mod=%d]: keep mask = 0x%X"
+                      % (operand, ir, mod, maskByte)))
+            kElemOffset = mmak * miK + ir * elementsPerVgpr + mod
+            module.add(VAddU32(
+              dst=vgpr(kPosCur), src0=kElemOffset, src1=vgpr(kPosBaseVgpr),
+              comment="byteRefine[%s ir=%d mod=%d]: K_pos = kPosBase + %d"
+                      % (operand, ir, mod, kElemOffset)))
+            module.add(VCmpGEI32(
+              dst=sgpr(maskSgpr, laneSGPRCount),
+              src0=vgpr(kPosCur), src1=sgpr("LoopCounterL"),
+              comment="byteRefine[%s ir=%d mod=%d]: K_pos >= LoopCounterL ?"
+                      % (operand, ir, mod)))
+            module.add(VCndMaskB32(
+              dst=vgpr(maskVgpr),
+              src0=vgpr(maskVgpr), src1=vgpr(seedVgpr),
+              src2=sgpr(maskSgpr, laneSGPRCount),
+              comment="byteRefine[%s ir=%d mod=%d]: mask = past ? 0x%X : prev"
+                      % (operand, ir, mod, maskByte)))
+        module.add(partialSkipLabel)
+
+      # mod=0: lanes whose K-position is at or past LoopCounterL get
+      # mask = 0 (entire VGPR zeroed by the v_and below). Always
+      # emitted -- subsumes the coarse per-VGPR cndmask for the
+      # operand/ir VGPRs (#5).
+      kElemOffset0 = mmak * miK + ir * elementsPerVgpr
+      module.add(VAddU32(
+        dst=vgpr(kPosCur), src0=kElemOffset0, src1=vgpr(kPosBaseVgpr),
+        comment="byteRefine[%s ir=%d mod=0]: K_pos = kPosBase + %d"
+                % (operand, ir, kElemOffset0)))
+      with self.allocTmpSgpr(laneSGPRCount,
+                             alignment=laneSGPRCount) as maskInfo:
+        maskSgpr = maskInfo.idx
         module.add(VCmpGEI32(
           dst=sgpr(maskSgpr, laneSGPRCount),
           src0=vgpr(kPosCur), src1=sgpr("LoopCounterL"),
-          comment="byteRefine[ir=%d]: K_pos >= LoopCounterL ?" % ir))
-        for vIdx in aIdxs:
-          module.add(VCndMaskB32(
-            dst=vgpr(vIdx), src0=vgpr(vIdx), src1=0,
-            src2=sgpr(maskSgpr, laneSGPRCount),
-            comment="zero ValuA[%u] (per-VGPR byte refine)" % vIdx))
-        for vIdx in bIdxs:
-          module.add(VCndMaskB32(
-            dst=vgpr(vIdx), src0=vgpr(vIdx), src1=0,
-            src2=sgpr(maskSgpr, laneSGPRCount),
-            comment="zero ValuB[%u] (per-VGPR byte refine)" % vIdx))
+          comment="byteRefine[%s ir=%d mod=0]: K_pos >= LoopCounterL ?"
+                  % (operand, ir)))
+        module.add(VCndMaskB32(
+          dst=vgpr(maskVgpr),
+          src0=vgpr(maskVgpr), src1=0,
+          src2=sgpr(maskSgpr, laneSGPRCount),
+          comment="byteRefine[%s ir=%d mod=0]: mask = past ? 0 : prev"
+                  % (operand, ir)))
+
+      for vIdx in idxs:
+        module.add(VAndB32(
+          dst=vgpr(vIdx), src0=vgpr(maskVgpr), src1=vgpr(vIdx),
+          comment="byteRefine[%s ir=%d]: apply mask to Valu%s[%u]"
+                  % (operand, ir, operand, vIdx)))
+
+    for ir in range(vgprPerInUnroll):
+      aIdxs = aIndicesByIr.get(ir, [])
+      bIdxs = bIndicesByIr.get(ir, [])
+      if aIdxs:
+        _emitChain("A", aIdxs, ir, bpeA, elementsPerVgprA)
+      if bIdxs:
+        _emitChain("B", bIdxs, ir, bpeB, elementsPerVgprB)
+
     self.vgprPool.checkIn(kPosCur)
-
-    if kernel["AssertSummationElementMultiple"] % 2 != 0:
-      skipLabel = Label(self.labels.getUniqueNamePrefix(
-        "SubtileTailByteHi16Skip"),
-        comment="even K_remain: skip odd-K hi16 clear")
-
-      with self.allocTmpSgpr(1) as kOddInfo:
-        kOddSgpr = kOddInfo.idx
-        module.add(SAndB32(
-          dst=sgpr(kOddSgpr), src0=sgpr("LoopCounterL"), src1=1,
-          comment="K_odd = LoopCounterL & 1"))
-        module.add(SCmpEQU32(
-          src0=sgpr(kOddSgpr), src1=0,
-          comment="K_remain even ?"))
-        module.add(SCBranchSCC1(
-          labelName=skipLabel.getLabelName(),
-          comment="skip hi16 clear on even K_remain"))
-
-      kPosHi = self.vgprPool.checkOut(1, "kPosHiByteRefine")
-      # Per-ir hi16 mask uses one cndmask + N v_ands instead of the
-      # legacy per-VGPR `v_and 0xFFFF + v_cndmask` pair. Seed VGPR
-      # carries the past-boundary mask value (0xFFFF) because the
-      # `v_cndmask_b32_e64` src1 slot does not accept a 32-bit
-      # literal on gfx950 — only src0 / inline constants / VGPR /
-      # SGPR are legal there. The in-range value (0xFFFFFFFF) goes
-      # in src0 as the inline `-1` constant, costing no literal slot.
-      hiSeedVgpr = self.vgprPool.checkOut(1, "hi16MaskSeed")
-      hiMaskVgpr = self.vgprPool.checkOut(1, "hi16MaskLane")
-      module.add(VMovB32(
-        dst=vgpr(hiSeedVgpr), src=hex(0xFFFF),
-        comment="hi16 mask seed = 0xFFFF (past-boundary lane value)"))
-      with self.allocTmpSgpr(laneSGPRCount,
-                             alignment=laneSGPRCount) as hiInfo:
-        hiSgpr = hiInfo.idx
-        for ir in range(vgprPerInUnroll):
-          aIdxs = aIndicesByIr.get(ir, [])
-          bIdxs = bIndicesByIr.get(ir, [])
-          if not aIdxs and not bIdxs:
-            continue
-          kOffsetHi = mmak * miK + ir * elementsPerVgpr + 1
-          module.add(VAddU32(
-            dst=vgpr(kPosHi), src0=kOffsetHi, src1=vgpr(kPosBaseVgpr),
-            comment="byteHi[ir=%d]: K_pos_hi = kPosBase + %d" % (ir, kOffsetHi)))
-          module.add(VCmpGEI32(
-            dst=sgpr(hiSgpr, laneSGPRCount),
-            src0=vgpr(kPosHi), src1=sgpr("LoopCounterL"),
-            comment="byteHi[ir=%d]: K_pos_hi >= LoopCounterL ?" % ir))
-          module.add(VCndMaskB32(
-            dst=vgpr(hiMaskVgpr),
-            src0=hex(0xFFFFFFFF), src1=vgpr(hiSeedVgpr),
-            src2=sgpr(hiSgpr, laneSGPRCount),
-            comment="byteHi[ir=%d]: hi16 mask = past ? 0xFFFF : 0xFFFFFFFF" % ir))
-          for vIdx in aIdxs:
-            module.add(VAndB32(
-              dst=vgpr(vIdx), src0=vgpr(hiMaskVgpr), src1=vgpr(vIdx),
-              comment="zero hi16 ValuA[%u] (odd-K boundary VGPR)" % vIdx))
-          for vIdx in bIdxs:
-            module.add(VAndB32(
-              dst=vgpr(vIdx), src0=vgpr(hiMaskVgpr), src1=vgpr(vIdx),
-              comment="zero hi16 ValuB[%u] (odd-K boundary VGPR)" % vIdx))
-      self.vgprPool.checkIn(kPosHi)
-      self.vgprPool.checkIn(hiSeedVgpr)
-      self.vgprPool.checkIn(hiMaskVgpr)
-
-      module.add(skipLabel)
+    self.vgprPool.checkIn(maskVgpr)
+    self.vgprPool.checkIn(seedVgpr)
     return module
 
 
@@ -4753,98 +4814,107 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       laneSGPRCount = self.states.laneSGPRCount
       for mmak in range(tiA.localMMATileGrid[1]):
-        with self.allocTmpSgpr(laneSGPRCount, alignment=laneSGPRCount) as tmpSgprInfo:
-          maskSgpr = tmpSgprInfo.idx
-          module.add(self._emitTailKPosCmpSubtile(kPosBaseVgpr, mmak, miK, maskSgpr))
-
-          # Hoisted lane-mask: cndmask each unique vgpr ONCE per mmak.
-          # atiles & scaleA vary only with mma0 (fixed across mma1);
-          # btiles & scaleB vary only with mma1 (fixed across mma0).
-          seenVgpr = set()
-
-          def _cndmaskVgpr(idx, label):
-            if idx < 0 or idx in seenVgpr:
-              return
-            seenVgpr.add(idx)
-            module.add(VCndMaskB32(
-                dst=vgpr(idx), src0=vgpr(idx), src1=0,
-                src2=sgpr(maskSgpr, laneSGPRCount),
-                comment="zero %s[%u] if K_idx >= sizeL" % (label, idx)))
-
+        # Two K-tail masking paths share this scaffold:
+        #   - Sub-lane byte refine (`_subtileTailByteShiftApplies`):
+        #     owns the per-lane mask end-to-end. Its mod=0 step is
+        #     equivalent to the coarse `kPos vs LoopCounterL` cmp +
+        #     per-VGPR cndmask the legacy path emitted, so we skip
+        #     the coarse path entirely (#5) when the byte refine
+        #     fires. Predicate excludes MX, so MXSA/MXSB cndmasks
+        #     are never needed in this branch.
+        #   - Coarse path (default): per-mmak cmp + per-VGPR
+        #     cndmask, including MXSA/MXSB when scales are present.
+        if self._subtileTailByteShiftApplies(kernel, numMIInUnroll):
+          # Group A/B operand VGPRs by their ir slot within each
+          # (mma0, mmak) / (mma1, mmak) tile; the byte refine emits
+          # one mask chain per (ir, operand) so the dedup is keyed
+          # by `vIdx` and asserts one ir per vIdx (sub-lane refine
+          # assumes the same VGPR holds the same K-slot across
+          # different mma{0,1} tiles, mirroring the legacy hoisted
+          # cndmask layout).
+          aIndicesByIr = {}
+          bIndicesByIr = {}
+          seenAByteVgpr = {}
+          seenBByteVgpr = {}
           for mma0 in range(tiA.localMMATileGrid[0]):
-            for idx in tiA.vgprTiles[_aTileId(mma0, mmak)].regList.indices:
-              _cndmaskVgpr(idx, "ValuA")
-            if hasScaleA:
-              _cndmaskVgpr(_scaleAVgpr(mma0, mmak), "ValuMXSA")
-
+            aIndices = tiA.vgprTiles[_aTileId(mma0, mmak)].regList.indices
+            for ir, vIdx in enumerate(aIndices):
+              if vIdx in seenAByteVgpr:
+                assert seenAByteVgpr[vIdx] == ir, (
+                  f"VGPR {vIdx} seen at ir {seenAByteVgpr[vIdx]} and "
+                  f"{ir}; sub-lane refine dedup assumes one ir per vIdx")
+                continue
+              seenAByteVgpr[vIdx] = ir
+              aIndicesByIr.setdefault(ir, []).append(vIdx)
           for mma1 in range(tiB.localMMATileGrid[0]):
-            for idx in tiB.vgprTiles[_bTileId(mma1, mmak)].regList.indices:
-              _cndmaskVgpr(idx, "ValuB")
-            if hasScaleB:
-              _cndmaskVgpr(_scaleBVgpr(mma1, mmak), "ValuMXSB")
+            bIndices = tiB.vgprTiles[_bTileId(mma1, mmak)].regList.indices
+            for ir, vIdx in enumerate(bIndices):
+              if vIdx in seenBByteVgpr:
+                assert seenBByteVgpr[vIdx] == ir, (
+                  f"VGPR {vIdx} seen at ir {seenBByteVgpr[vIdx]} and "
+                  f"{ir}; sub-lane refine dedup assumes one ir per vIdx")
+                continue
+              seenBByteVgpr[vIdx] = ir
+              bIndicesByIr.setdefault(ir, []).append(vIdx)
+          module.add(self._emitTailSubLaneMaskRefineSubtile(
+              kernel, kPosBaseVgpr, mmak, miK, numMIInUnroll,
+              aIndicesByIr, bIndicesByIr))
+        else:
+          with self.allocTmpSgpr(laneSGPRCount,
+                                 alignment=laneSGPRCount) as tmpSgprInfo:
+            maskSgpr = tmpSgprInfo.idx
+            module.add(self._emitTailKPosCmpSubtile(
+                kPosBaseVgpr, mmak, miK, maskSgpr))
 
-          # Sub-lane K-tail mask refinement for bf16 with ASEM <
-          # numMIInUnroll. The coarse cndmask above zeros only whole
-          # lane groups whose entire K-window is past LoopCounterL;
-          # this helper zeros the boundary lane group's per-VGPR
-          # sub-lane bytes. Gated by `_subtileTailByteShiftApplies`
-          # (excludes the MX scale path, which uses padded scales).
-          # The helper takes deduped VGPR indices grouped by per-tile
-          # K-slot `ir` so a single VCmpGEI32 per slot covers every
-          # (mma0, mma1) tile at once, mirroring the parent's hoisted-
-          # cndmask layout. The dedup assumes one `ir` per `vIdx`; the
-          # asserts below pin that contract.
-          if self._subtileTailByteShiftApplies(kernel, numMIInUnroll):
-            aIndicesByIr = {}
-            bIndicesByIr = {}
-            seenAByteVgpr = {}
-            seenBByteVgpr = {}
+            # Hoisted lane-mask: cndmask each unique vgpr ONCE per
+            # mmak. atiles & scaleA vary only with mma0 (fixed
+            # across mma1); btiles & scaleB vary only with mma1
+            # (fixed across mma0).
+            seenVgpr = set()
+
+            def _cndmaskVgpr(idx, label):
+              if idx < 0 or idx in seenVgpr:
+                return
+              seenVgpr.add(idx)
+              module.add(VCndMaskB32(
+                  dst=vgpr(idx), src0=vgpr(idx), src1=0,
+                  src2=sgpr(maskSgpr, laneSGPRCount),
+                  comment="zero %s[%u] if K_idx >= sizeL" % (label, idx)))
+
             for mma0 in range(tiA.localMMATileGrid[0]):
-              aIndices = tiA.vgprTiles[_aTileId(mma0, mmak)].regList.indices
-              for ir, vIdx in enumerate(aIndices):
-                if vIdx in seenAByteVgpr:
-                  assert seenAByteVgpr[vIdx] == ir, (
-                    f"VGPR {vIdx} seen at ir {seenAByteVgpr[vIdx]} and "
-                    f"{ir}; sub-lane refine dedup assumes one ir per vIdx")
-                  continue
-                seenAByteVgpr[vIdx] = ir
-                aIndicesByIr.setdefault(ir, []).append(vIdx)
-            for mma1 in range(tiB.localMMATileGrid[0]):
-              bIndices = tiB.vgprTiles[_bTileId(mma1, mmak)].regList.indices
-              for ir, vIdx in enumerate(bIndices):
-                if vIdx in seenBByteVgpr:
-                  assert seenBByteVgpr[vIdx] == ir, (
-                    f"VGPR {vIdx} seen at ir {seenBByteVgpr[vIdx]} and "
-                    f"{ir}; sub-lane refine dedup assumes one ir per vIdx")
-                  continue
-                seenBByteVgpr[vIdx] = ir
-                bIndicesByIr.setdefault(ir, []).append(vIdx)
-            module.add(self._emitTailSubLaneMaskRefineSubtile(
-                kernel, kPosBaseVgpr, mmak, miK, numMIInUnroll,
-                aIndicesByIr, bIndicesByIr))
-
-          # MFMA grid -- inputs already lane-masked above.
-          for mma1 in range(tiB.localMMATileGrid[0]):
-            for mma0 in range(tiA.localMMATileGrid[0]):
-              atiles = tiA.vgprTiles[_aTileId(mma0, mmak)]
-              btiles = tiB.vgprTiles[_bTileId(mma1, mmak)]
-              dtiles = dtileInfo.vgprTiles[mma0 + mma1 * dtileInfo.localMMATileGrid[0]]
-
+              for idx in tiA.vgprTiles[_aTileId(mma0, mmak)].regList.indices:
+                _cndmaskVgpr(idx, "ValuA")
               if hasScaleA:
-                scaleAVgpr = _scaleAVgpr(mma0, mmak)
-                scaleBVgpr = _scaleBVgpr(mma1, mmak)
-                sAsel = (mma0 % 2) + 2 * (mmak % 2)
-                sBsel = (mma1 % 2) + 2 * (mmak % 2)
-              else:
-                scaleAVgpr = scaleBVgpr = -1
-                sAsel = sBsel = -1
+                _cndmaskVgpr(_scaleAVgpr(mma0, mmak), "ValuMXSA")
 
-              module.add(emitMfmaInstruction(
-                  self, kernel, atiles, btiles, dtiles, dtiles,
-                  scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr,
-                  scaleAsel=sAsel, scaleBsel=sBsel,
-                  comment="tail MFMA C[%u,%u] += A[%u,%u] * B[%u,%u] (mmak=%u)" %
-                          (mma0, mma1, mma0, mmak, mmak, mma1, mmak)))
+            for mma1 in range(tiB.localMMATileGrid[0]):
+              for idx in tiB.vgprTiles[_bTileId(mma1, mmak)].regList.indices:
+                _cndmaskVgpr(idx, "ValuB")
+              if hasScaleB:
+                _cndmaskVgpr(_scaleBVgpr(mma1, mmak), "ValuMXSB")
+
+        # MFMA grid -- inputs already lane-masked above.
+        for mma1 in range(tiB.localMMATileGrid[0]):
+          for mma0 in range(tiA.localMMATileGrid[0]):
+            atiles = tiA.vgprTiles[_aTileId(mma0, mmak)]
+            btiles = tiB.vgprTiles[_bTileId(mma1, mmak)]
+            dtiles = dtileInfo.vgprTiles[mma0 + mma1 * dtileInfo.localMMATileGrid[0]]
+
+            if hasScaleA:
+              scaleAVgpr = _scaleAVgpr(mma0, mmak)
+              scaleBVgpr = _scaleBVgpr(mma1, mmak)
+              sAsel = (mma0 % 2) + 2 * (mmak % 2)
+              sBsel = (mma1 % 2) + 2 * (mmak % 2)
+            else:
+              scaleAVgpr = scaleBVgpr = -1
+              sAsel = sBsel = -1
+
+            module.add(emitMfmaInstruction(
+                self, kernel, atiles, btiles, dtiles, dtiles,
+                scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr,
+                scaleAsel=sAsel, scaleBsel=sBsel,
+                comment="tail MFMA C[%u,%u] += A[%u,%u] * B[%u,%u] (mmak=%u)" %
+                        (mma0, mma1, mma0, mmak, mmak, mma1, mmak)))
 
         # Per-mmak early exit: when LoopCounterL (= K mod DU = K_tail)
         # is fully consumed by the mmaks we've already issued
