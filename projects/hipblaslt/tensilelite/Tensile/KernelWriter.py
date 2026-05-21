@@ -4678,15 +4678,35 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # Mainloop GR/LR goes through LogicalScheduler / InstructionEmitter
       # using scheduler-owned vgprs; the tail reuses the legacy
       # globalReadDoSubtile / localReadDoSubtile helpers which read
-      # tileInfo.vgprTiles directly, so we allocate a fresh range here
-      # and release it before closeLoop. D-tile vgprs are shared.
-      tailAllocTiles = [self.states.a.tileInfo, self.states.b.tileInfo]
+      # tileInfo.vgprTiles directly. D-tile vgprs are shared.
+      #
+      # VGPR pressure split: the historic bulk alloc kept every mmak's
+      # A/B vgprTiles live across the per-mmak MFMA loop (e.g. at
+      # MT 320x288x64 BF16, 10 A tiles + 36 B tiles * 4 vgprs each
+      # = 184 vgprs concurrent across mmak), which on top of the
+      # D-tile vgpr-overflow blew the wave-64 256-VGPR occupancy
+      # budget. The mmak-th K-slice of `vgprTiles` is the only thing
+      # the MFMA grid for `mmak` consumes, so A/B vgprTiles are now
+      # allocated / freed per-mmak inside the loop below (see
+      # `allocVgprTileRegistersForMmak`). Only one slice's worth of
+      # A+B vgprs is live at a time -- 92 instead of 184 for the
+      # MT 320x288 case, dropping the high-water to ~210 (4 setup +
+      # 112 D overflow + 92 slice + 2 scratch).
+      #
+      # MX scale tiles keep the bulk alloc: their LR subtile shape
+      # `(2, 2)` packs `_mma0` into the tile id which the slice
+      # formula does not unroll, and the cross-mmak VGPR sharing
+      # means a per-mmak slice would re-emit the same ds_read into
+      # the same VGPR.
+      self.states.a.tileInfo.initVgprTileSlots(self, kernel)
+      self.states.b.tileInfo.initVgprTileSlots(self, kernel)
+      mxAllocTiles = []
       if kernel["ProblemType"].get("MXBlockA", 0) > 0:
-        tailAllocTiles.append(self.states.mxsa.tileInfo)
+        mxAllocTiles.append(self.states.mxsa.tileInfo)
       if kernel["ProblemType"].get("MXBlockB", 0) > 0:
-        tailAllocTiles.append(self.states.mxsb.tileInfo)
-      for tailTile in tailAllocTiles:
-        tailTile.allocVgprTileRegisters_legacy(self, kernel)
+        mxAllocTiles.append(self.states.mxsb.tileInfo)
+      for mxTile in mxAllocTiles:
+        mxTile.allocVgprTileRegisters_legacy(self, kernel)
 
       # Re-issue one DepthU-shaped GR + LR. Byte-layout identical to a
       # mainloop iter; lane mask below zeros lanes past K_tail.
@@ -4751,15 +4771,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
                           comment="tail GR: wait for DTL writes to LDS"))
       module.add(SBarrier(comment="tail GR: LDS sync before LR"))
 
-      module.add(localReadDoSubtile('A', self, kernel))
-      module.add(localReadDoSubtile('B', self, kernel))
+      # MX scale LR fires once up front: each scale VGPR holds
+      # mmak-shared bytes (LR subtile shape `(2, 2)` packs `mmak //
+      # subtileKShape` into the scale group), so a per-mmak re-issue
+      # would just rewrite the same VGPR. A/B LR is emitted inside
+      # the per-mmak loop below so the destination vgprTiles can be
+      # checked out / released per iteration.
       if kernel["ProblemType"].get("MXBlockA", 0) > 0:
         module.add(localReadDoScaleSubtile('MXSA', self, kernel))
       if kernel["ProblemType"].get("MXBlockB", 0) > 0:
         module.add(localReadDoScaleSubtile('MXSB', self, kernel))
-
-      module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1,
-                          comment="tail LR: wait for ds_reads before lane mask + MFMA"))
 
       # Per-mmak: lane mask + MFMA. Mirrors Subtile/Kernel.py:emitMfmaCode
       # including D-tile index resolution so the masked VGPRs feed the
@@ -4814,6 +4835,20 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       laneSGPRCount = self.states.laneSGPRCount
       for mmak in range(tiA.localMMATileGrid[1]):
+        # Per-mmak slice alloc + LR: pull only the current mmak's
+        # A/B vgprTiles into the pool, emit ds_reads for the
+        # corresponding K-slice (data lives in LDS after the bulk
+        # GR above), wait for the ds_reads to retire, then run the
+        # masking + MFMA grid. The slice is freed at the bottom of
+        # the iteration so peak VGPR pressure tracks one slice
+        # instead of the full A/B vgprTiles range.
+        aMmakSlice = tiA.allocVgprTileRegistersForMmak(self, kernel, mmak)
+        bMmakSlice = tiB.allocVgprTileRegistersForMmak(self, kernel, mmak)
+        module.add(emitSubtileDsReadForMmak('A', self, kernel, mmak))
+        module.add(emitSubtileDsReadForMmak('B', self, kernel, mmak))
+        module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1,
+                            comment="tail LR mmak=%u: wait for ds_reads before lane mask + MFMA" % mmak))
+
         # Two K-tail masking paths share this scaffold:
         #   - Sub-lane byte refine (`_subtileTailByteShiftApplies`):
         #     owns the per-lane mask end-to-end. Its mod=0 step is
@@ -4916,6 +4951,15 @@ class KernelWriter(metaclass=abc.ABCMeta):
                 comment="tail MFMA C[%u,%u] += A[%u,%u] * B[%u,%u] (mmak=%u)" %
                         (mma0, mma1, mma0, mmak, mmak, mma1, mmak)))
 
+        # Release this mmak's A/B slice before the next mmak's
+        # alloc (or the early-exit branch). The dealloc only affects
+        # emit-time pool accounting -- it doesn't emit instructions
+        # -- so a runtime early-exit branch out is balanced too: the
+        # slice for the current mmak is fully released here, and the
+        # branch target downstream of the loop sees a clean pool.
+        tiA.freeVgprTileRegistersForMmak(self, kernel, aMmakSlice)
+        tiB.freeVgprTileRegistersForMmak(self, kernel, bMmakSlice)
+
         # Per-mmak early exit: when LoopCounterL (= K mod DU = K_tail)
         # is fully consumed by the mmaks we've already issued
         # (K_tail <= MIK * (mmak + 1)), all subsequent (mmak+1, ...)
@@ -4932,8 +4976,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
               labelName=Label.getFormatting("SkipTailLoop%s" % loopChar),
               comment="early-exit tail after subIterK=%u (no valid K left)" % mmak))
 
-      for tailTile in tailAllocTiles:
-        tailTile.deallocVgprTileRegisters_legacy(self, kernel)
+      # Empty the now-unused A/B slot lists; the per-mmak alloc/free
+      # pattern above already released every VGPR back to the pool.
+      self.states.a.tileInfo.vgprTiles = []
+      self.states.b.tileInfo.vgprTiles = []
+      for mxTile in mxAllocTiles:
+        mxTile.deallocVgprTileRegisters_legacy(self, kernel)
 
       # The scaffold's mmak loop processes ALL K_tail in one body pass,
       # but closeLoop emits a per-iter `LoopCounterL -= MatrixInstK`
