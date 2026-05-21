@@ -184,8 +184,9 @@ class TestAnyKEmit_K1:
     """ASEM=1 (odd K). `buffer_load_*_d16 ... lds` is not legal on
     gfx950, so the scaffold relies on OOB-clipped wide DTL + the
     runtime-gated hi16 clear in `_emitTailSubLaneMaskRefineSubtile`
-    Step 2 (`s_and_b32 LoopCounterL, 1` -> branch -> `v_and_b32 0xFFFF`
-    + `v_cndmask_b32`).
+    Step 2 (`s_and_b32 LoopCounterL, 1` -> branch -> seed `v_mov
+    vSeed, 0xFFFF` -> per-ir `v_cmp_ge_i32` + `v_cndmask vMask,
+    0xFFFFFFFF, vSeed, smask` + N x `v_and_b32 vIdx, vMask, vIdx`).
     """
 
     def test_k1_no_narrow_load_and_has_hi16_clear(self):
@@ -223,26 +224,99 @@ class TestAnyKEmit_K1:
             "(K_remain & 1 gate). Tail excerpt:\n" + tail[:2000]
         )
 
-        and_ffff = re.search(r"v_and_b32[^\n]*0xffff", tail, re.IGNORECASE)
-        assert and_ffff is not None, (
-            "ASEM=1 emit missing `v_and_b32 ..., 0xFFFF, ...` for "
-            "hi16 clear of the odd-K boundary VGPR."
+        # Mask seed: `v_mov_b32 vSeed, 0xFFFF` outside the per-ir
+        # loop, carrying the past-boundary mask value. Emitted once
+        # per `_emitTailSubLaneMaskRefineSubtile` call (i.e. once
+        # per mmak slice). Required because the `v_cndmask_b32_e64`
+        # src1 slot on gfx950 does not accept a 32-bit literal —
+        # only inline constants / VGPR / SGPR are legal there.
+        seed_movs = re.findall(
+            r"v_mov_b32\s+v\d+,\s+0xffff"
+            r"[^\n]*hi16 mask seed",
+            tail,
+            re.IGNORECASE,
+        )
+        assert len(seed_movs) >= 1, (
+            "ASEM=1 emit missing `v_mov_b32 vSeed, 0xFFFF` hi16 "
+            "mask seed. The seed must be hoisted outside the per-ir "
+            "loop because the v_cndmask src1 cannot hold a 32-bit "
+            "literal. Tail excerpt:\n" + tail[:2000]
         )
 
-        # Hi16 cndmask src order: `v_cndmask_b32 vdst, vdst,
-        # v<hiClearVgpr>, s[<lo>:<hi>]` — the masked-low hi16-cleared
-        # value is src1 and the runtime hi16 mask is the SGPR pair
-        # src2. dst == src0 keeps the original VGPR on
-        # `K_pos_hi < LoopCounterL` lanes.
-        cnd_hi = re.search(
-            r"v_cndmask_b32\s+v(\d+),\s+v\1,\s+v\d+,\s+s\[\d+:\d+\]"
-            r"[^\n]*hi16",
+        # Per-ir hi16 mask select: at least one `v_cndmask_b32
+        # vMask, 0xFFFFFFFF, vSeed, s[<lo>:<hi>]` per `v_cmp` group.
+        # 0xFFFFFFFF (= inline -1) in src0 selects on in-range
+        # lanes (identity); vSeed in src1 selects 0xFFFF on past-
+        # boundary lanes (zeroes hi16 under the following v_and).
+        # This is the structural fingerprint of the optimized form
+        # (one cndmask + N v_ands replacing N cndmasks + N v_ands).
+        cnd_mask_select = re.findall(
+            r"v_cndmask_b32\s+v\d+,\s+0xffffffff,\s+v\d+,\s+s\[\d+:\d+\]"
+            r"[^\n]*hi16 mask",
+            tail,
+            re.IGNORECASE,
+        )
+        assert len(cnd_mask_select) >= 1, (
+            "ASEM=1 emit missing `v_cndmask_b32 vMask, 0xFFFFFFFF, "
+            "vSeed, s[<lo>:<hi>]` per-ir mask-select. Tail "
+            "excerpt:\n" + tail[:2000]
+        )
+
+        # Per-VGPR hi16 clear: `v_and_b32 vIdx, vMask, vIdx` — the
+        # mask vreg is src0 and the boundary VGPR is both dst and
+        # src1. dst==src1 lets the AND zero hi16 in place on
+        # past-boundary lanes and acts as identity on in-range
+        # lanes (vMask=0xFFFFFFFF). Must be present for both ValuA
+        # and ValuB boundary VGPRs.
+        and_hi_a = re.search(
+            r"v_and_b32\s+v(\d+),\s+v\d+,\s+v\1"
+            r"[^\n]*zero hi16 ValuA",
             tail,
         )
-        assert cnd_hi is not None, (
-            "ASEM=1 emit missing `v_cndmask_b32 v<dst>, v<dst>, "
-            "v<hiClearVgpr>, s[<lo>:<hi>]` for odd-K hi16 clear. "
-            "Tail excerpt:\n" + tail[:2000]
+        assert and_hi_a is not None, (
+            "ASEM=1 emit missing `v_and_b32 v<idx>, v<mask>, v<idx>` "
+            "(zero hi16 ValuA[..]) per-VGPR hi16 clear. Tail "
+            "excerpt:\n" + tail[:2000]
+        )
+        and_hi_b = re.search(
+            r"v_and_b32\s+v(\d+),\s+v\d+,\s+v\1"
+            r"[^\n]*zero hi16 ValuB",
+            tail,
+        )
+        assert and_hi_b is not None, (
+            "ASEM=1 emit missing `v_and_b32 v<idx>, v<mask>, v<idx>` "
+            "(zero hi16 ValuB[..]) per-VGPR hi16 clear. Tail "
+            "excerpt:\n" + tail[:2000]
+        )
+
+        # Negative pin on the legacy shape. The old form had a
+        # `v_and_b32 vTmp, 0xFFFF, vIdx` step per boundary VGPR
+        # (comment-tagged `0xFFFF (hi16 -> 0)`) followed by a
+        # `v_cndmask_b32 vIdx, vIdx, vTmp, s[..]` (comment-tagged
+        # `hi16 Valu...`). The optimized form keeps no inline
+        # 0xFFFF literal in any v_and, and emits no per-VGPR
+        # cndmask in the hi16 region.
+        legacy_and_ffff = re.search(
+            r"v_and_b32\s+v\d+,\s+0xffff,\s+v\d+"
+            r"[^\n]*hi16 -> 0",
+            tail,
+            re.IGNORECASE,
+        )
+        assert legacy_and_ffff is None, (
+            "ASEM=1 emit must NOT contain the legacy per-VGPR "
+            "`v_and_b32 v<tmp>, 0xFFFF, v<idx>  // ... hi16 -> 0` "
+            "step (replaced by per-ir mask-select + per-VGPR v_and)."
+        )
+        legacy_cnd_hi_per_vgpr = re.search(
+            r"v_cndmask_b32\s+v(\d+),\s+v\1,\s+v\d+,\s+s\[\d+:\d+\]"
+            r"[^\n]*hi16 Valu",
+            tail,
+        )
+        assert legacy_cnd_hi_per_vgpr is None, (
+            "ASEM=1 emit must NOT contain the legacy per-VGPR "
+            "`v_cndmask_b32 v<idx>, v<idx>, v<tmp>, s[..]` for hi16 "
+            "clear (replaced by per-VGPR `v_and_b32 v<idx>, "
+            "v<mask>, v<idx>`)."
         )
 
 

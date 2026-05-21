@@ -4411,7 +4411,18 @@ class KernelWriter(metaclass=abc.ABCMeta):
           comment="skip hi16 clear on even K_remain"))
 
       kPosHi = self.vgprPool.checkOut(1, "kPosHiByteRefine")
-      hiClearVgpr = self.vgprPool.checkOut(1, "hi16ClearTmp")
+      # Per-ir hi16 mask uses one cndmask + N v_ands instead of the
+      # legacy per-VGPR `v_and 0xFFFF + v_cndmask` pair. Seed VGPR
+      # carries the past-boundary mask value (0xFFFF) because the
+      # `v_cndmask_b32_e64` src1 slot does not accept a 32-bit
+      # literal on gfx950 — only src0 / inline constants / VGPR /
+      # SGPR are legal there. The in-range value (0xFFFFFFFF) goes
+      # in src0 as the inline `-1` constant, costing no literal slot.
+      hiSeedVgpr = self.vgprPool.checkOut(1, "hi16MaskSeed")
+      hiMaskVgpr = self.vgprPool.checkOut(1, "hi16MaskLane")
+      module.add(VMovB32(
+        dst=vgpr(hiSeedVgpr), src=hex(0xFFFF),
+        comment="hi16 mask seed = 0xFFFF (past-boundary lane value)"))
       with self.allocTmpSgpr(laneSGPRCount,
                              alignment=laneSGPRCount) as hiInfo:
         hiSgpr = hiInfo.idx
@@ -4428,24 +4439,22 @@ class KernelWriter(metaclass=abc.ABCMeta):
             dst=sgpr(hiSgpr, laneSGPRCount),
             src0=vgpr(kPosHi), src1=sgpr("LoopCounterL"),
             comment="byteHi[ir=%d]: K_pos_hi >= LoopCounterL ?" % ir))
+          module.add(VCndMaskB32(
+            dst=vgpr(hiMaskVgpr),
+            src0=hex(0xFFFFFFFF), src1=vgpr(hiSeedVgpr),
+            src2=sgpr(hiSgpr, laneSGPRCount),
+            comment="byteHi[ir=%d]: hi16 mask = past ? 0xFFFF : 0xFFFFFFFF" % ir))
           for vIdx in aIdxs:
             module.add(VAndB32(
-              dst=vgpr(hiClearVgpr), src0=hex(0xFFFF), src1=vgpr(vIdx),
-              comment="ValuA[%u] & 0xFFFF (hi16 -> 0)" % vIdx))
-            module.add(VCndMaskB32(
-              dst=vgpr(vIdx), src0=vgpr(vIdx), src1=vgpr(hiClearVgpr),
-              src2=sgpr(hiSgpr, laneSGPRCount),
+              dst=vgpr(vIdx), src0=vgpr(hiMaskVgpr), src1=vgpr(vIdx),
               comment="zero hi16 ValuA[%u] (odd-K boundary VGPR)" % vIdx))
           for vIdx in bIdxs:
             module.add(VAndB32(
-              dst=vgpr(hiClearVgpr), src0=hex(0xFFFF), src1=vgpr(vIdx),
-              comment="ValuB[%u] & 0xFFFF (hi16 -> 0)" % vIdx))
-            module.add(VCndMaskB32(
-              dst=vgpr(vIdx), src0=vgpr(vIdx), src1=vgpr(hiClearVgpr),
-              src2=sgpr(hiSgpr, laneSGPRCount),
+              dst=vgpr(vIdx), src0=vgpr(hiMaskVgpr), src1=vgpr(vIdx),
               comment="zero hi16 ValuB[%u] (odd-K boundary VGPR)" % vIdx))
       self.vgprPool.checkIn(kPosHi)
-      self.vgprPool.checkIn(hiClearVgpr)
+      self.vgprPool.checkIn(hiSeedVgpr)
+      self.vgprPool.checkIn(hiMaskVgpr)
 
       module.add(skipLabel)
     return module
