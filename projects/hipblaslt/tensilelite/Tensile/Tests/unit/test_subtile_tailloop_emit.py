@@ -1052,3 +1052,220 @@ class TestTailEmitContent_PGR1:
         assert re.search(
             r"s_cmp_lt_u32\s+s\[?\d+\]?,\s*1\b[^\n]*origCounter < PGR", tail
         )
+
+
+# ── Tests: Srd<tc>+2 tightening at tail entry ────────────────────────────────
+
+class TestTailSrdTightenSubtile:
+    """`_emitTailSrdTightenSubtile` emit shape (nakajee #PR-7661 OOR review).
+
+    The tightening fires once at tail entry (after the PGR>0 entry
+    gating, before openLoop), shrinks `SrdA+2` and `SrdB+2` by
+    `DepthU*bpe - roundUp(K_remain*bpe, loadBytesGR)`, and is gated to
+    non-MX, non-swizzled, bpe in {1,2}, symmetric A/B kernels. Earlier
+    m-rows are over-protected (handled by lane mask + sub-lane refine);
+    the tightening's job is exclusively the last m-row's last GR thread
+    which would otherwise read past A/B's allocated K bytes.
+    """
+
+    @pytest.fixture
+    def bf16_pgr0_asm(self):
+        return _emit_tail_loop_asm(fp4=False, no_tail_loop=False, pgr=0)
+
+    @pytest.fixture
+    def bf16_pgr2_asm(self):
+        return _emit_tail_loop_asm(fp4=False, no_tail_loop=False, pgr=2)
+
+    @pytest.fixture
+    def fp4_pgr0_asm(self):
+        return _emit_tail_loop_asm(fp4=True, no_tail_loop=False, pgr=0)
+
+    def test_emits_srd_tighten_banner(self, bf16_pgr0_asm):
+        """bf16 subtile must emit the SRD tighten comment banner so
+        the rest of the structural pins below have a stable anchor.
+        """
+        tail = _extract_tail_section(bf16_pgr0_asm)
+        assert tail
+        assert "OOR review" in tail or "nakajee #PR-7661" in tail, (
+            "Tail must emit the `_emitTailSrdTightenSubtile` banner "
+            "referencing the nakajee #PR-7661 OOR review.\n"
+            "Tail head:\n" + tail[:2000]
+        )
+
+    def test_emits_alignedBytes_chain(self, bf16_pgr0_asm):
+        """The aligned-K-bytes chain is the runtime fingerprint of the
+        helper: `s_lshl_b32 <s>, sgprLoopCounterL, 0x1` (bf16 bpe=2)
+        then `s_add_u32 <s>, <s>, 15` and `s_and_b32 <s>, <s>, 0xfffffff0`
+        for loadBytes=16 (AB_B16 default).
+        """
+        tail = _extract_tail_section(bf16_pgr0_asm)
+        assert tail
+        assert re.search(
+            r"s_lshl_b32\s+s\[?\d+\]?,\s*s\[sgprLoopCounterL\]\s*,\s*0x1\b"
+            r"[^\n]*K_remain \* bpe \(bpe=2\)",
+            tail
+        ), "Tail must compute `K_remain * bpe` via s_lshl_b32 ..., 0x1"
+        assert re.search(
+            r"s_add_u32\s+s\[?\d+\]?,\s*s\[?\d+\]?,\s*15\b"
+            r"[^\n]*\+ \(loadBytes-1\) for roundUp",
+            tail
+        ), "Tail must add (loadBytes-1)=15 before align-mask"
+        assert re.search(
+            r"s_and_b32\s+s\[?\d+\]?,\s*s\[?\d+\]?,\s*0xfffffff0\b"
+            r"[^\n]*alignedBytes = roundUp\(K_remain\*bpe, 16\)",
+            tail
+        ), (
+            "Tail must mask to align up to loadBytes=16 boundary "
+            "(loadMaskInv = 0xfffffff0 for B128 bf16 loads)"
+        )
+
+    def test_emits_srd_tighten_skip_branch(self, bf16_pgr0_asm):
+        """When `alignedBytes >= DepthU*bpe`, the natural SRD limit
+        already covers every K-direction read. The helper emits an
+        `s_cmp_lt_u32 <s>, DepthU*bpe` + `s_cbranch_scc0` short-
+        circuit before the SSub chain so the runtime no-op is one
+        branch deep instead of two SSubU32 + carry.
+        """
+        tail = _extract_tail_section(bf16_pgr0_asm)
+        assert tail
+        # bf16 fixture has DepthU=64 -> depthUBytes=128 (0x80).
+        assert re.search(
+            r"s_cmp_lt_u32\s+s\[?\d+\]?,\s*(?:128|0x80)\b"
+            r"[^\n]*alignedBytes < DepthU\*bpe",
+            tail
+        ), "Tail must compare alignedBytes against depthUBytes (128 / 0x80)"
+        assert re.search(
+            r"s_cbranch_scc0\s+label_TailSrdTightenSkip[^\n]*natural SRD already tight",
+            tail
+        ), "Tail must short-circuit to TailSrdTightenSkip<L> when delta <= 0"
+
+    def test_emits_srd_tighten_ssub_chain(self, bf16_pgr0_asm):
+        """The actual tightening: `s_sub_u32 SrdA+2, SrdA+2, <delta>`
+        and the matching `s_sub_u32 SrdB+2, SrdB+2, <delta>`. Pin the
+        `delta = DepthU*bpe - alignedBytes` precompute too so the
+        emit order isn't accidentally rearranged.
+        """
+        tail = _extract_tail_section(bf16_pgr0_asm)
+        assert tail
+        assert re.search(
+            r"s_sub_u32\s+s\[?\d+\]?,\s*(?:128|0x80)\s*,\s*s\[?\d+\]?"
+            r"[^\n]*delta = DepthU\*bpe - alignedBytes",
+            tail
+        ), (
+            "Tail must precompute `delta = depthUBytes - alignedBytes`"
+            " before applying it to Srd<tc>+2"
+        )
+        assert re.search(
+            r"s_sub_u32\s+s\[sgprSrdA\+2\]\s*,\s*s\[sgprSrdA\+2\]\s*,\s*s\[?\d+\]?"
+            r"[^\n]*Srd A\+2 -= delta",
+            tail
+        ), "Tail must subtract delta from Srd A+2"
+        assert re.search(
+            r"s_sub_u32\s+s\[sgprSrdB\+2\]\s*,\s*s\[sgprSrdB\+2\]\s*,\s*s\[?\d+\]?"
+            r"[^\n]*Srd B\+2 -= delta",
+            tail
+        ), "Tail must subtract delta from Srd B+2"
+
+    def test_skip_label_emitted(self, bf16_pgr0_asm):
+        """The `TailSrdTightenSkip<L>:` label is the branch target of
+        the runtime no-op short-circuit. It must be defined so the
+        cbranch resolves.
+        """
+        tail = _extract_tail_section(bf16_pgr0_asm)
+        assert tail
+        assert "TailSrdTightenSkipL:" in tail or \
+               "label_TailSrdTightenSkipL:" in tail, (
+            "Tail must define `TailSrdTightenSkipL:` as the skip target.\n"
+            "Tail head:\n" + tail[:2000]
+        )
+
+    def test_ssub_chain_lives_inside_skip_region(self, bf16_pgr0_asm):
+        """Strict ordering: the `s_sub_u32 SrdA+2` line must appear
+        AFTER the `s_cbranch_scc0` short-circuit and BEFORE the
+        `TailSrdTightenSkipL:` label. Otherwise the runtime no-op
+        wouldn't actually no-op (we'd execute the subs unconditionally).
+        """
+        tail = _extract_tail_section(bf16_pgr0_asm)
+        assert tail
+        br_pos = tail.find("TailSrdTightenSkip")  # the branch reference
+        label_pos = tail.find("TailSrdTightenSkipL:")
+        if label_pos < 0:
+            label_pos = tail.find("label_TailSrdTightenSkipL:")
+        srdA_match = re.search(
+            r"s_sub_u32\s+s\[sgprSrdA\+2\][^\n]*Srd A\+2 -= delta",
+            tail)
+        assert br_pos >= 0 and label_pos >= 0 and srdA_match, (
+            "Missing one of: branch, label, or SrdA+2 sub. tail head:\n"
+            + tail[:2000]
+        )
+        srdA_pos = srdA_match.start()
+        assert br_pos < srdA_pos < label_pos, (
+            "Tail must order branch < SrdA+2 sub < TailSrdTightenSkipL "
+            "label so the cbranch_scc0 short-circuits the SSub chain. "
+            "Got br=%d, srdA=%d, label=%d" % (br_pos, srdA_pos, label_pos)
+        )
+
+    def test_srd_tighten_omitted_for_fp4(self, fp4_pgr0_asm):
+        """MX kernels (MXBlockA/B > 0) must not emit the SRD tighten
+        helper: MX scales have their own host re-scatter padding
+        (`DataInitialization.rearrangePaddedMXScaleLayout`), and MX
+        data + MXSA/MXSB SRD tightening needs the swizzleBlock-aware
+        formula from nakajee's spec (separate follow-up).
+        """
+        tail = _extract_tail_section(fp4_pgr0_asm)
+        assert tail
+        assert "OOR review" not in tail, (
+            "MX FP4 tail must NOT emit the bf16/fp16 SRD tighten "
+            "(deferred to swizzleBlock-aware follow-up)."
+        )
+        assert "TailSrdTightenSkip" not in tail, (
+            "MX FP4 tail must NOT define TailSrdTightenSkip<L>"
+        )
+
+    def test_srd_tighten_omitted_for_NoTailLoop(self):
+        """`NoTailLoop=True` (aligned K) emits no tail body at all,
+        so the SRD tighten helper must short-circuit early (no
+        instructions, no skip label).
+        """
+        asm = _emit_tail_loop_asm(fp4=False, no_tail_loop=True, pgr=0)
+        assert "OOR review" not in asm
+        assert "TailSrdTightenSkip" not in asm
+
+    def test_srd_tighten_fires_for_pgr2(self, bf16_pgr2_asm):
+        """PGR=2 emits the SRD tighten in the same slot (after the
+        PGR>0 entry gating, before openLoop). Pin its presence so
+        a refactor of the PGR>0 gate ordering doesn't drop it.
+        """
+        tail = _extract_tail_section(bf16_pgr2_asm)
+        assert tail
+        assert re.search(
+            r"s_sub_u32\s+s\[sgprSrdA\+2\][^\n]*Srd A\+2 -= delta",
+            tail
+        ), (
+            "PGR=2 bf16 tail must still emit SrdA+2 tighten. "
+            "Tail head:\n" + tail[:2000]
+        )
+
+    def test_srd_tighten_ordering_after_PGRTailEntry(self, bf16_pgr2_asm):
+        """For PGR>0, the tighten must fire AFTER `PGRTailEntry<L>:`
+        (so the c=0 / small-counter realign / large-counter advance
+        paths have all converged) and BEFORE the tail GR call (so
+        `globalReadDoSubtile` sees the tightened SRD).
+        """
+        tail = _extract_tail_section(bf16_pgr2_asm)
+        assert tail
+        entry_pos = tail.find("PGRTailEntryL:")
+        if entry_pos < 0:
+            entry_pos = tail.find("label_PGRTailEntryL:")
+        srdA_match = re.search(
+            r"s_sub_u32\s+s\[sgprSrdA\+2\][^\n]*Srd A\+2 -= delta", tail)
+        assert entry_pos >= 0 and srdA_match, (
+            "PGR=2 tail must have both PGRTailEntryL: label and "
+            "SrdA+2 tighten. tail head:\n" + tail[:2000]
+        )
+        assert entry_pos < srdA_match.start(), (
+            "PGR=2 tail must emit SRD tighten AFTER PGRTailEntryL: "
+            "so c=0 / small-counter / large-counter all converge "
+            "before the tightening fires. entry=%d, srdA=%d"
+            % (entry_pos, srdA_match.start())
+        )

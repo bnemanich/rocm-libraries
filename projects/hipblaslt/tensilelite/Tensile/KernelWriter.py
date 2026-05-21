@@ -36,7 +36,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB192, BufferLoadB32, Bu
   DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB192, FlatLoadB32, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, MXMFMAInstruction, SAddU32, SAddCU32, SAndB32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpGeU32, SCmpLeU32, SCmpLtU32, \
-  SMFMAInstruction, SNop, SEndpgm, SSetPrior, SSetRegIMM32B32, SSubBU32, SSubU32, SWaitCnt, SWaitAlu, \
+  SLShiftLeftB32, SMFMAInstruction, SNop, SEndpgm, SSetPrior, SSetRegIMM32B32, SSubBU32, SSubU32, SWaitCnt, SWaitAlu, \
   SLongBranchPositive, VAddU32, VCmpEQI32, VCmpGEI32, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VNop, Instruction
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
@@ -4343,6 +4343,128 @@ class KernelWriter(metaclass=abc.ABCMeta):
         return False
     return True
 
+  def _emitTailSrdTightenSubtile(self, kernel):
+    """Tighten `Srd<tc>+2` (buffer NumRecords) at tail entry so the
+    K-direction reads of the re-issued tail GR cannot wander past
+    A/B's actual end-of-array on the last m-row of the tile. Addresses
+    nakajee's OOR review (PR #7661 carried forward from PR #7636
+    "Comment 5" TODO at the tail GR site).
+
+    Formula:
+      alignedBytes = roundUp(LoopCounterL * bpe, loadBytesGR)
+      delta_bytes  = DepthU * bpe - alignedBytes
+      Srd<tc>+2   -= delta_bytes        (when delta_bytes > 0)
+
+    `roundUp(..., loadBytesGR)` keeps the load valid for every
+    per-thread `buffer_load_<...>` whose K-range overlaps
+    `[0, K_remain)` -- including the trailing odd-K element on bf16
+    when a single load straddles `K_remain*bpe`. Earlier m-rows are
+    over-protected (their k_lane >= K_remain reads still pass the
+    tightened limit but get zeroed in VGPR by the per-MFMA lane
+    mask + sub-lane refine, so correctness is unchanged).
+
+    Runtime-clamped: when `alignedBytes >= DepthU*bpe` the natural
+    SRD limit already covers every read and a single `s_cbranch_scc0
+    TailSrdTightenSkip<L>` short-circuits the SSub chain.
+
+    Gating (the helper is only called from
+    `_emitTailLoopScaffoldSubtile`, which already runs only for
+    `UseSubtileImpl=True` kernels with `NoTailLoop=False`, so this
+    helper does not re-check those two; it gates the remaining
+    out-of-scope subtile variants):
+      - non-MX (`MXBlock{A,B} == 0`) -- MX scales have their own
+        host re-scatter padding (`DataInitialization.cpp`
+        `rearrangePaddedMXScaleLayout`); MX data + MXSA/MXSB SRD
+        tightening uses the swizzleBlock-aware formula from
+        nakajee's spec and is a follow-up;
+      - non-swizzled A/B (`SwizzleTensor{A,B}=False`) -- subtile
+        mxfp4 swizzled A/B also need the swizzleBlock formula,
+        same follow-up;
+      - symmetric per-tensor bpe (A and B same dtype), bpe in {1, 2}
+        (bf16 / fp16 / int8 anyk paths are the immediate consumer);
+      - symmetric per-tensor `loadWidthGR` (per-thread B128 / B64 /
+        B32 etc. shape matches across A/B in the gated kernels).
+
+    No SRD restore is needed: the tail body is the last GR site for
+    A/B before the kernel epilogue (epilogue uses SrdC / SrdD).
+    """
+    module = Module("tailSrdTightenSubtile")
+    if kernel["ProblemType"].get("MXBlockA", 0) > 0 \
+       or kernel["ProblemType"].get("MXBlockB", 0) > 0:
+      return module
+    if kernel["ProblemType"].get("SwizzleTensorA", False) \
+       or kernel["ProblemType"].get("SwizzleTensorB", False):
+      return module
+
+    tiA = self.states.a.tileInfo
+    tiB = self.states.b.tileInfo
+    bpeA = int(tiA.bpe)
+    bpeB = int(tiB.bpe)
+    if bpeA != bpeB or bpeA not in (1, 2):
+      return module
+    bpe = bpeA
+    loadBytesA = int(tiA.loadWidthGR)
+    loadBytesB = int(tiB.loadWidthGR)
+    if loadBytesA != loadBytesB or loadBytesA <= 0:
+      return module
+    loadBytes = loadBytesA
+    depthU = int(kernel["DepthU"])
+    depthUBytes = depthU * bpe
+    # `loadBytes` is a hardware load-shape multiple of 4; require
+    # loadBytes <= depthUBytes so `alignedBytes < depthUBytes` is
+    # reachable (otherwise the clamp would always fire).
+    if loadBytes > depthUBytes:
+      return module
+    # Round-down mask used to align scaledKRem up to a load boundary.
+    loadMaskInv = (~(loadBytes - 1)) & 0xffffffff
+    unrollIdx = self.states.unrollIdx
+    loopChar = self.states.indexChars[
+      kernel["ProblemType"]["IndicesSummation"][unrollIdx]]
+    skipLabel = Label("TailSrdTightenSkip%s" % loopChar, "")
+
+    module.addComment2(
+      "Tighten Srd<tc>+2 to K_remain*bpe rounded up to GR load "
+      "granularity (nakajee #PR-7661 OOR review)")
+    with self.allocTmpSgpr(2) as tmpInfo:
+      scaledKRem = tmpInfo.idx
+      delta = tmpInfo.idx + 1
+      # scaledKRem = K_remain * bpe
+      if bpe == 2:
+        module.add(SLShiftLeftB32(
+          dst=sgpr(scaledKRem), src=sgpr("LoopCounterL"), shiftHex=hex(1),
+          comment="K_remain * bpe (bpe=2)"))
+      else:
+        module.add(SMovB32(
+          dst=sgpr(scaledKRem), src=sgpr("LoopCounterL"),
+          comment="K_remain * bpe (bpe=1)"))
+      # scaledKRem = roundUp(scaledKRem, loadBytes)
+      module.add(SAddU32(
+        dst=sgpr(scaledKRem), src0=sgpr(scaledKRem), src1=(loadBytes - 1),
+        comment="+ (loadBytes-1) for roundUp"))
+      module.add(SAndB32(
+        dst=sgpr(scaledKRem), src0=sgpr(scaledKRem), src1=hex(loadMaskInv),
+        comment="alignedBytes = roundUp(K_remain*bpe, %u)" % loadBytes))
+      # Skip when alignedBytes >= depthUBytes -- natural limit already
+      # tight; SSub would underflow or no-op.
+      module.add(SCmpLtU32(
+        src0=sgpr(scaledKRem), src1=depthUBytes,
+        comment="alignedBytes < DepthU*bpe?"))
+      module.add(SCBranchSCC0(
+        labelName=skipLabel.getLabelName(),
+        comment="natural SRD already tight; skip SRD tighten"))
+      # delta = depthUBytes - alignedBytes (positive)
+      module.add(SSubU32(
+        dst=sgpr(delta), src0=depthUBytes, src1=sgpr(scaledKRem),
+        comment="delta = DepthU*bpe - alignedBytes"))
+      module.add(SSubU32(
+        dst=sgpr("SrdA+2"), src0=sgpr("SrdA+2"), src1=sgpr(delta),
+        comment="Srd A+2 -= delta (clip K past K_remain on last m-row)"))
+      module.add(SSubU32(
+        dst=sgpr("SrdB+2"), src0=sgpr("SrdB+2"), src1=sgpr(delta),
+        comment="Srd B+2 -= delta (clip K past K_remain on last m-row)"))
+      module.add(skipLabel)
+    return module
+
   def _emitTailSubLaneMaskRefineSubtile(self, kernel, kPosBaseVgpr, mmak, miK,
                                         numMIInUnroll, aIndicesByIr, bIndicesByIr):
     """Sub-lane K-tail mask refinement: zero past-LoopCounterL bytes
@@ -4893,6 +5015,14 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       module.add(self.openLoop(kernel, tensorParametersA, tensorParametersB, -1, None))
 
+      # Tighten Srd<tc>+2 (NumRecords) for A/B against out-of-array
+      # reads on the last m-row when K_remain < DepthU; see
+      # `_emitTailSrdTightenSubtile` for the formula, gating, and the
+      # runtime no-op clamp. MX (data + scale) and swizzled A/B paths
+      # are deferred to a follow-up (they need the swizzleBlock-aware
+      # formula from nakajee's spec).
+      module.add(self._emitTailSrdTightenSubtile(kernel))
+
       # No SRD rewind here. For PGR=0 the mainloop's per-iter GR_INC
       # leaves Srd<tc> at the K-tail's first byte after K//DU iters,
       # so the tail GR reads correct data from current SRD. For PGR>0
@@ -4940,13 +5070,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # Re-issue one DepthU-shaped GR + LR. Byte-layout identical to a
       # mainloop iter; lane mask below zeros lanes past K_tail.
       #
-      # TODO: Tighten Srd<tc>+2 (NumRecords) at tail entry to
-      # bound-clip K-direction reads past K_rem*bpe.
-      # The buffer-NumRecords field is a single linear-byte limit, so
-      # a tight per-row K clamp is only achievable for the last M-row
-      # of the tile; the per-MFMA lane mask in the tail body remains
-      # the actual correctness mechanism for in-range M rows. Filed
-      # as a follow-up after this PR lands.
+      # A/B Srd+2 was tightened just above by
+      # `_emitTailSrdTightenSubtile` to clip the last m-row's K reads
+      # past `roundUp(K_remain*bpe, loadBytesGR)` (returns 0 via
+      # buffer-OOB). MX scale SRDs (MXSA/MXSB) and swizzled A/B SRDs
+      # still need the swizzleBlock-aware variant from nakajee's spec
+      # (PR #7661 review); MX scales are also protected by host
+      # re-scatter padding (`DataInitialization.rearrangePaddedMXScaleLayout`).
       module.add(globalReadDoSubtile('A', self, kernel))
       module.add(globalReadDoSubtile('B', self, kernel))
 
