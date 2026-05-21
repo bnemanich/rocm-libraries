@@ -35,6 +35,13 @@ and a single per-(operand, ir) mask chain feeds a `v_and` against
 each boundary VGPR. The mask chain folds in mod = `elementsPerVgpr`-1
 down to 0 byte slots, statically skipped when `ASEM*bpe % bpr == 0`
 and runtime-gated by `LoopCounterL & (elementsPerVgpr-1)` otherwise.
+
+With `SubtileTailMaskPrecompute` enabled (the default) the whole
+per-(operand, mmak, ir) mask chain is emitted ONCE before the
+per-mmak MFMA loop into dedicated scratch VGPRs; the per-mmak step
+then collapses to pure `v_and_b32 vIdx, vMask[..], vIdx` (no cmps,
+no cndmasks). The K%2 / K%1 emit pins below verify both the
+hoisted-chain shape and the v_and-only apply step.
 """
 import re
 
@@ -188,10 +195,12 @@ class TestAnyKEmit_K2:
         assert tail_k2, "K%2 emit produced no tail block"
         assert tail_k32, "K%32 baseline emit produced no tail block"
 
-        # Byte refine emits one mask chain per (operand, ir): each
-        # chain starts with `v_mov vMask, 0xFFFFFFFF` then folds the
-        # mod=0 cndmask + per-VGPR v_and. Strictly more cmps than
-        # the K%32 baseline (which only has the per-mmak coarse cmp).
+        # Byte refine emits one mask chain per (operand, mmak, ir);
+        # with `SubtileTailMaskPrecompute=True` (default) the chain
+        # is hoisted into a precompute block BEFORE the per-mmak
+        # loop and the per-mmak step is a pure `v_and` apply. Still
+        # strictly more cmps than the K%32 baseline (which only has
+        # the per-mmak coarse cmp).
         cmp_k2 = re.findall(r"v_cmp_ge_i32.*LoopCounterL", tail_k2)
         cmp_k32 = re.findall(r"v_cmp_ge_i32.*LoopCounterL", tail_k32)
         assert len(cmp_k2) > len(cmp_k32), (
@@ -200,8 +209,9 @@ class TestAnyKEmit_K2:
             f"cmp_k32={len(cmp_k32)}."
         )
 
-        # Per-(operand, ir) mask seed: `v_mov_b32 vMask, 0xFFFFFFFF`
-        # tagged with the seed comment.
+        # Per-(operand, mmak, ir) mask seed: `v_mov_b32 vMask,
+        # 0xFFFFFFFF` tagged with the seed comment. With shared
+        # A/B masks (bpeA==bpeB), one chain per (mmak, ir).
         seed_movs = re.findall(
             r"v_mov_b32\s+v\d+,\s*0xffffffff[^\n]*mask seed = full keep",
             tail_k2, re.IGNORECASE,
@@ -227,24 +237,50 @@ class TestAnyKEmit_K2:
             "excerpt:\n" + tail_k2[:2000]
         )
 
-        # Per-VGPR mask application: `v_and_b32 vIdx, vMask, vIdx`.
+        # Per-VGPR mask application: `v_and_b32 vIdx, vMask, vIdx`
+        # with the precompute-mode comment.
         and_a = re.search(
             r"v_and_b32\s+v(\d+),\s+v\d+,\s+v\1"
-            r"[^\n]*apply mask to ValuA",
+            r"[^\n]*apply precomputed mask to ValuA",
             tail_k2,
         )
         and_b = re.search(
             r"v_and_b32\s+v(\d+),\s+v\d+,\s+v\1"
-            r"[^\n]*apply mask to ValuB",
+            r"[^\n]*apply precomputed mask to ValuB",
             tail_k2,
         )
         assert and_a is not None, (
             "K%2 emit missing per-VGPR `v_and_b32 vIdx, vMask, vIdx` "
-            "for ValuA boundary VGPR. Tail excerpt:\n" + tail_k2[:2000]
+            "(apply precomputed mask to ValuA) for boundary VGPR. "
+            "Tail excerpt:\n" + tail_k2[:2000]
         )
         assert and_b is not None, (
             "K%2 emit missing per-VGPR `v_and_b32 vIdx, vMask, vIdx` "
-            "for ValuB boundary VGPR. Tail excerpt:\n" + tail_k2[:2000]
+            "(apply precomputed mask to ValuB) for boundary VGPR. "
+            "Tail excerpt:\n" + tail_k2[:2000]
+        )
+
+        # Precompute hoist: the cmp+cndmask chain (and its
+        # K_pos = kPosBase + offset adds) must appear BEFORE any
+        # `s_waitcnt ... wait for ds_reads before lane mask + MFMA`
+        # marker. The per-mmak apply step lives AFTER that marker.
+        ds_wait_idx = tail_k2.find("tail LR mmak=0: wait for ds_reads")
+        assert ds_wait_idx > 0, (
+            "K%2 emit missing per-mmak `tail LR mmak=0: wait for "
+            "ds_reads ...` marker."
+        )
+        precompute_chain_idx = tail_k2.find(
+            "byteRefine[A ir=0 mmak=0]: mask seed")
+        assert 0 < precompute_chain_idx < ds_wait_idx, (
+            "K%2 emit must hoist the byteRefine chain BEFORE the "
+            "first per-mmak ds_read wait (precompute block).\n"
+            "Chain@%d, ds_wait@%d" % (precompute_chain_idx, ds_wait_idx)
+        )
+        first_v_and_apply = tail_k2.find(
+            "apply precomputed mask to ValuA")
+        assert first_v_and_apply > ds_wait_idx, (
+            "K%2 emit must place the `v_and_b32 ... apply precomputed "
+            "mask to ValuA` AFTER the per-mmak ds_read wait."
         )
 
         # ir-th VGPR's K_pos offset must appear in the v_add chain.
@@ -398,25 +434,43 @@ class TestAnyKEmit_K1:
         )
 
         # Per-VGPR mask application for both ValuA and ValuB.
+        # Precompute-mode comment ("apply precomputed mask to ...").
         and_a = re.search(
             r"v_and_b32\s+v(\d+),\s+v\d+,\s+v\1"
-            r"[^\n]*apply mask to ValuA",
+            r"[^\n]*apply precomputed mask to ValuA",
             tail,
         )
         and_b = re.search(
             r"v_and_b32\s+v(\d+),\s+v\d+,\s+v\1"
-            r"[^\n]*apply mask to ValuB",
+            r"[^\n]*apply precomputed mask to ValuB",
             tail,
         )
         assert and_a is not None, (
             "ASEM=1 emit missing `v_and_b32 vIdx, vMask, vIdx` "
-            "(apply mask to ValuA[..]) per-VGPR mask application. "
-            "Tail excerpt:\n" + tail[:2000]
+            "(apply precomputed mask to ValuA[..]) per-VGPR mask "
+            "application. Tail excerpt:\n" + tail[:2000]
         )
         assert and_b is not None, (
             "ASEM=1 emit missing `v_and_b32 vIdx, vMask, vIdx` "
-            "(apply mask to ValuB[..]) per-VGPR mask application. "
-            "Tail excerpt:\n" + tail[:2000]
+            "(apply precomputed mask to ValuB[..]) per-VGPR mask "
+            "application. Tail excerpt:\n" + tail[:2000]
+        )
+
+        # ASEM=1 partial chain runs UNDER the runtime gate inside
+        # the precompute block (before any per-mmak ds_read wait).
+        # The runtime gate label and mod=1 keep-mask seed must
+        # appear in the precompute prefix, not in the per-mmak
+        # apply step.
+        ds_wait_idx = tail.find("tail LR mmak=0: wait for ds_reads")
+        assert ds_wait_idx > 0, (
+            "ASEM=1 emit missing per-mmak `tail LR mmak=0: wait for "
+            "ds_reads` marker."
+        )
+        gate_pos = tail.find("partial-mod residue")
+        assert 0 < gate_pos < ds_wait_idx, (
+            "ASEM=1 emit must place the partial-mod runtime gate "
+            "INSIDE the precompute block (before the first per-mmak "
+            "ds_read wait)."
         )
 
         # #5 negative pin: the legacy coarse per-VGPR cndmask is
@@ -459,6 +513,233 @@ class TestAnyKEmit_K1:
             "ASEM=1 emit must NOT contain the legacy "
             "`SubtileTailByteHi16Skip` label (the unified mask "
             "chain uses `SubtileTailByteShiftPartialSkip` instead)."
+        )
+
+
+# ── Precompute + apply split: per-(mmak, ir) mask precompute ─────────────────
+
+class TestAnyKEmit_Precompute:
+    """`SubtileTailMaskPrecompute` (default True) hoists every
+    per-(operand, mmak, ir) byte-mask chain ABOVE the per-mmak loop
+    into dedicated scratch VGPRs. The per-mmak step collapses to a
+    pure `v_and_b32 vIdx, vMask[..], vIdx`. These tests pin the
+    hoist structure, the v_and-only apply shape, and the config
+    switch's two modes (precompute on/off).
+    """
+
+    def test_precompute_block_before_per_mmak_loop(self):
+        """ASEM=2 (byte refine path). Every cmp+cndmask chain step
+        for both mmak=0 and mmak=1 must appear BEFORE the first
+        `tail LR mmak=0 ... wait for ds_reads` marker — that marker
+        opens the per-mmak loop body, and the precompute lives
+        upstream of it. After the marker, the per-mmak apply step
+        must NOT emit any further `v_cmp_ge_i32 ... LoopCounterL`
+        or `v_cndmask_b32 ... mod=0 ... past ? 0 : prev`; those are
+        all hoisted.
+        """
+        tail = _extract_tail_section(_emit_anyk_tail_asm(asem=2, pgr=0))
+        assert tail
+
+        loop_marker = "tail LR mmak=0: wait for ds_reads"
+        marker_idx = tail.find(loop_marker)
+        assert marker_idx > 0, "Missing per-mmak loop marker"
+
+        precompute_section = tail[:marker_idx]
+        apply_section = tail[marker_idx:]
+
+        # mmak=0 AND mmak=1 chains must appear in the precompute
+        # section (each lives under its own seed comment).
+        assert "byteRefine[A ir=0 mmak=0]: mask seed" in precompute_section, (
+            "Precompute section must contain the mmak=0 ir=0 chain"
+        )
+        assert "byteRefine[A ir=0 mmak=1]: mask seed" in precompute_section, (
+            "Precompute section must contain the mmak=1 ir=0 chain "
+            "(all subIterK chains hoisted up front)"
+        )
+
+        # Apply section must NOT contain any cmp/cndmask chain
+        # primitive — only v_and_b32.
+        assert re.search(
+            r"v_cmp_ge_i32[^\n]*LoopCounterL", apply_section
+        ) is None, (
+            "Per-mmak apply section must NOT emit v_cmp_ge_i32 "
+            "(hoisted out into the precompute block)."
+        )
+        assert re.search(
+            r"v_cndmask_b32[^\n]*mod=0", apply_section
+        ) is None, (
+            "Per-mmak apply section must NOT emit mod=0 cndmask "
+            "(hoisted out into the precompute block)."
+        )
+        assert re.search(
+            r"v_mov_b32[^\n]*mask seed = full keep", apply_section
+        ) is None, (
+            "Per-mmak apply section must NOT emit a mask seed "
+            "v_mov (hoisted out into the precompute block)."
+        )
+
+    def test_precompute_shares_mask_vgpr_between_A_and_B(self):
+        """bf16/bf16 has bpeA==bpeB so the per-(mmak, ir) mask is
+        identical for A and B; the precompute must allocate ONE
+        mask VGPR per (mmak, ir) and reuse it across A's and B's
+        v_and apply steps (halves the VGPR cost vs per-operand
+        masks).
+        """
+        tail = _extract_tail_section(_emit_anyk_tail_asm(asem=2, pgr=0))
+        assert tail
+
+        # Collect the source-VGPR of each `v_and ... apply
+        # precomputed mask to Valu{A,B}` line, keyed by (op, mmak,
+        # ir). Each operand-side group at the same (mmak, ir) must
+        # share its mask VGPR with the OTHER operand at the same
+        # (mmak, ir).
+        masks_by_key = {}
+        for op in ("A", "B"):
+            for m in re.finditer(
+                r"v_and_b32\s+v\d+,\s+v(\d+),\s+v\d+"
+                r"[^\n]*apply precomputed mask to Valu" + op
+                + r"\[\d+\][^\n]*",
+                tail,
+            ):
+                # The seed comment baked the mmak/ir; recover them
+                # from the line by looking at the same comment.
+                # Each line's full text contains
+                # 'byteRefine[<op> ir=<ir> mmak=<mmak>]:'.
+                line_match = re.search(
+                    r"byteRefine\[(A|B) ir=(\d+) mmak=(\d+)\]",
+                    m.group(0))
+                assert line_match, "Apply line missing byteRefine tag"
+                key = (line_match.group(2), line_match.group(3))
+                masks_by_key.setdefault((op, key), set()).add(
+                    int(m.group(1)))
+
+        # Per (op, (ir, mmak)) the apply lines all use one mask
+        # VGPR.
+        for (op, key), mask_set in masks_by_key.items():
+            assert len(mask_set) == 1, (
+                "Apply lines for (%s, ir=%s, mmak=%s) must reference "
+                "exactly one mask VGPR; got %r"
+                % (op, key[0], key[1], sorted(mask_set))
+            )
+
+        # A and B must share their mask VGPR at the same (ir, mmak).
+        keys = set(k for (_, k) in masks_by_key.keys())
+        for key in keys:
+            ma = next(iter(masks_by_key[("A", key)]))
+            mb = next(iter(masks_by_key[("B", key)]))
+            assert ma == mb, (
+                "A and B at (ir=%s, mmak=%s) must share the same "
+                "precomputed mask VGPR (bpeA==bpeB → dedupe); got "
+                "A=v%d, B=v%d." % (key[0], key[1], ma, mb)
+            )
+
+    def test_precompute_disabled_reverts_to_legacy_per_mmak_inline(self):
+        """`SubtileTailMaskPrecompute=False` must revert to the
+        legacy per-mmak inline chain (apply comment loses the
+        `precomputed` qualifier, and the chain instructions appear
+        AFTER each per-mmak ds_read wait, not before).
+        """
+        from Tensile.Tests.unit._subtile_tailloop_fixtures import (
+            build_minimal_subtile_kwa,
+            setdefault_tail_scaffold_kernel_keys,
+            wrap_with_skiptoend,
+        )
+
+        kernel = _create_kernel(MT0=128, MT1=128, fp4=False,
+                                depthU=64, no_tail_loop=False)
+        setdefault_tail_scaffold_kernel_keys(kernel, pgr=0, asem=2)
+        kernel["SubtileTailMaskPrecompute"] = False
+        kwa = build_minimal_subtile_kwa(kernel)
+        module = kwa._emitTailLoopScaffoldSubtile(
+            kernel,
+            {"is_sparse": False, "tpsMetadata": None},
+            {"is_sparse": False, "tpsMetadata": None})
+        tail = _extract_tail_section(wrap_with_skiptoend(module))
+        assert tail
+
+        # Legacy apply comment (no "precomputed").
+        assert re.search(
+            r"v_and_b32[^\n]*apply mask to ValuA\b", tail
+        ) is not None, (
+            "Legacy mode must emit `apply mask to ValuA[..]` "
+            "(no `precomputed` qualifier)."
+        )
+        assert re.search(
+            r"v_and_b32[^\n]*apply precomputed mask to Valu", tail
+        ) is None, (
+            "Legacy mode must NOT emit `apply precomputed mask to "
+            "...` (that comment is only used when precompute fires)."
+        )
+
+        # Chain emission must come AFTER each per-mmak ds_read wait
+        # (inline within the loop body), not BEFORE.
+        loop_marker = "tail LR mmak=0: wait for ds_reads"
+        marker_idx = tail.find(loop_marker)
+        assert marker_idx > 0
+        precompute_section = tail[:marker_idx]
+        assert "mask seed = full keep" not in precompute_section, (
+            "Legacy mode must NOT emit any chain seed BEFORE the "
+            "per-mmak loop (no precompute block)."
+        )
+
+    def test_no_tail_loop_emits_no_precompute(self):
+        """NoTailLoop=True elides the entire tail body; the
+        precompute block must not appear (nothing references it).
+        """
+        from Tensile.Tests.unit._subtile_tailloop_fixtures import (
+            build_minimal_subtile_kwa,
+            setdefault_tail_scaffold_kernel_keys,
+            wrap_with_skiptoend,
+        )
+
+        kernel = _create_kernel(MT0=128, MT1=128, fp4=False,
+                                depthU=64, no_tail_loop=True)
+        setdefault_tail_scaffold_kernel_keys(kernel, pgr=0, asem=2)
+        kwa = build_minimal_subtile_kwa(kernel)
+        module = kwa._emitTailLoopScaffoldSubtile(
+            kernel,
+            {"is_sparse": False, "tpsMetadata": None},
+            {"is_sparse": False, "tpsMetadata": None})
+        asm = wrap_with_skiptoend(module)
+
+        assert "byteRefine[" not in asm, (
+            "NoTailLoop=True must NOT emit any byteRefine chain "
+            "(no tail body → no precompute)."
+        )
+        assert "apply precomputed mask" not in asm, (
+            "NoTailLoop=True must NOT emit any precomputed-mask apply."
+        )
+
+    def test_coarse_path_unaffected_by_precompute_switch(self):
+        """ASEM>=numMIInUnroll uses the coarse per-mmak cmp+cndmask
+        path (byte refine does not fire). The precompute switch
+        only governs the byte-refine path, so the coarse emit shape
+        must be identical whether precompute is enabled or not.
+        """
+        from Tensile.Tests.unit._subtile_tailloop_fixtures import (
+            build_minimal_subtile_kwa,
+            setdefault_tail_scaffold_kernel_keys,
+            wrap_with_skiptoend,
+        )
+
+        def _emit_with(precompute):
+            kernel = _create_kernel(MT0=128, MT1=128, fp4=False,
+                                    depthU=64, no_tail_loop=False)
+            setdefault_tail_scaffold_kernel_keys(kernel, pgr=0, asem=32)
+            kernel["SubtileTailMaskPrecompute"] = precompute
+            kwa = build_minimal_subtile_kwa(kernel)
+            module = kwa._emitTailLoopScaffoldSubtile(
+                kernel,
+                {"is_sparse": False, "tpsMetadata": None},
+                {"is_sparse": False, "tpsMetadata": None})
+            return _extract_tail_section(wrap_with_skiptoend(module))
+
+        tail_on = _emit_with(True)
+        tail_off = _emit_with(False)
+        assert tail_on == tail_off, (
+            "Coarse-path (ASEM=32 byte-refine inapplicable) tail "
+            "emit must be identical with SubtileTailMaskPrecompute "
+            "on vs off."
         )
 
 

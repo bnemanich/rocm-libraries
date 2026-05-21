@@ -4521,6 +4521,223 @@ class KernelWriter(metaclass=abc.ABCMeta):
     return module
 
 
+  def _emitTailSubLaneMaskChainIntoVgpr(self, kernel, operand, kPosBaseVgpr,
+                                        mmak, ir, miK, bpe, elementsPerVgpr,
+                                        targetMaskVgpr, kPosCurVgpr, seedVgpr):
+    """Emit ONE per-(operand, mmak, ir) byte-mask chain into
+    `targetMaskVgpr`. Mirrors the chain body from
+    `_emitTailSubLaneMaskRefineSubtile._emitChain` (static skip +
+    runtime gate + mod>0 chain + mod=0 step) but writes its result to
+    a caller-owned VGPR instead of v_anding it back into A/B tile
+    VGPRs. The apply step (`_emitTailSubLaneMaskApplySubtile`) does
+    the v_and per (operand, ir, vIdx).
+
+    Caller owns the lifecycle of `targetMaskVgpr` (held live across
+    the per-mmak loop), `kPosCurVgpr` and `seedVgpr` (transient
+    scratch shared across all chains in a precompute call).
+    """
+    laneSGPRCount = self.states.laneSGPRCount
+    bpr = 4
+    asem = kernel["AssertSummationElementMultiple"]
+
+    module = Module("tailSubLaneMaskChainIntoVgpr %s mmak=%u ir=%u"
+                    % (operand, mmak, ir))
+    staticSkipPartial = (asem * bpe) % bpr == 0
+    module.add(VMovB32(
+      dst=vgpr(targetMaskVgpr), src=hex(0xFFFFFFFF),
+      comment="byteRefine[%s ir=%d mmak=%d]: mask seed = full keep"
+              % (operand, ir, mmak)))
+
+    if not staticSkipPartial:
+      partialSkipLabel = Label(self.labels.getUniqueNamePrefix(
+        "SubtileTailByteShiftPartialSkip"),
+        comment="K_remain partial-mod aligned: skip mod>0 mask chain")
+      with self.allocTmpSgpr(1) as gateInfo:
+        gateSgpr = gateInfo.idx
+        module.add(SAndB32(
+          dst=sgpr(gateSgpr), src0=sgpr("LoopCounterL"),
+          src1=hex(elementsPerVgpr - 1),
+          comment="LoopCounterL & (elementsPerVgpr-1) = partial-mod residue"))
+        module.add(SCmpEQU32(
+          src0=sgpr(gateSgpr), src1=0,
+          comment="K_remain partial-mod aligned ?"))
+        module.add(SCBranchSCC1(
+          labelName=partialSkipLabel.getLabelName(),
+          comment="skip mod>0 chain on aligned K_remain"))
+      with self.allocTmpSgpr(laneSGPRCount,
+                             alignment=laneSGPRCount) as maskInfo:
+        maskSgpr = maskInfo.idx
+        for mod in range(elementsPerVgpr - 1, 0, -1):
+          maskByte = (1 << (mod * bpe * 8)) - 1
+          module.add(VMovB32(
+            dst=vgpr(seedVgpr), src=hex(maskByte),
+            comment="byteRefine[%s ir=%d mod=%d]: keep mask = 0x%X"
+                    % (operand, ir, mod, maskByte)))
+          kElemOffset = mmak * miK + ir * elementsPerVgpr + mod
+          module.add(VAddU32(
+            dst=vgpr(kPosCurVgpr), src0=kElemOffset, src1=vgpr(kPosBaseVgpr),
+            comment="byteRefine[%s ir=%d mod=%d]: K_pos = kPosBase + %d"
+                    % (operand, ir, mod, kElemOffset)))
+          module.add(VCmpGEI32(
+            dst=sgpr(maskSgpr, laneSGPRCount),
+            src0=vgpr(kPosCurVgpr), src1=sgpr("LoopCounterL"),
+            comment="byteRefine[%s ir=%d mod=%d]: K_pos >= LoopCounterL ?"
+                    % (operand, ir, mod)))
+          module.add(VCndMaskB32(
+            dst=vgpr(targetMaskVgpr),
+            src0=vgpr(targetMaskVgpr), src1=vgpr(seedVgpr),
+            src2=sgpr(maskSgpr, laneSGPRCount),
+            comment="byteRefine[%s ir=%d mod=%d]: mask = past ? 0x%X : prev"
+                    % (operand, ir, mod, maskByte)))
+      module.add(partialSkipLabel)
+
+    kElemOffset0 = mmak * miK + ir * elementsPerVgpr
+    module.add(VAddU32(
+      dst=vgpr(kPosCurVgpr), src0=kElemOffset0, src1=vgpr(kPosBaseVgpr),
+      comment="byteRefine[%s ir=%d mod=0]: K_pos = kPosBase + %d"
+              % (operand, ir, kElemOffset0)))
+    with self.allocTmpSgpr(laneSGPRCount,
+                           alignment=laneSGPRCount) as maskInfo:
+      maskSgpr = maskInfo.idx
+      module.add(VCmpGEI32(
+        dst=sgpr(maskSgpr, laneSGPRCount),
+        src0=vgpr(kPosCurVgpr), src1=sgpr("LoopCounterL"),
+        comment="byteRefine[%s ir=%d mod=0]: K_pos >= LoopCounterL ?"
+                % (operand, ir)))
+      module.add(VCndMaskB32(
+        dst=vgpr(targetMaskVgpr),
+        src0=vgpr(targetMaskVgpr), src1=0,
+        src2=sgpr(maskSgpr, laneSGPRCount),
+        comment="byteRefine[%s ir=%d mod=0]: mask = past ? 0 : prev"
+                % (operand, ir)))
+    return module
+
+
+  def _emitTailSubLaneMaskPrecomputeSubtile(self, kernel, kPosBaseVgpr,
+                                            numMmaks, miK, numMIInUnroll):
+    """Precompute every per-(operand, mmak, ir) K-tail byte mask into
+    long-lived scratch VGPRs *before* the per-mmak MFMA loop runs.
+    The hot per-mmak path then becomes a pure
+    `v_and_b32 vIdx, maskVgpr, vIdx` apply step (see
+    `_emitTailSubLaneMaskApplySubtile`), hoisting the cmp + cndmask
+    chain out of the loop.
+
+    Storage layout / dedup:
+      - Returns `maskVgprMap[(operand, mmak, ir)] -> vgpr_index`.
+      - When `bpeA == bpeB` (and therefore the mod-chain produces
+        identical masks for both operands at the same (mmak, ir)),
+        the A and B keys map to the SAME vgpr (halves the VGPR
+        cost for the common bf16/bf16 case).
+      - Persistent VGPR count for the common case:
+        `N = numMmaks * (numMIInUnroll // elementsPerVgpr)`. For
+        bf16 ASEM<8 (the byte-refine fixture path) with
+        numMIInUnroll=8, elementsPerVgpr=2 → 4 vgprs per mmak,
+        × 2 mmaks (DU=64) = 8 persistent vgprs. Higher-DU configs
+        scale linearly with `numMmaks`.
+
+    Returns:
+      `(module, maskVgprMap, allocatedMaskVgprs)`:
+        - `module` holds the emitted chain instructions.
+        - `maskVgprMap` is the (operand, mmak, ir) → vgpr lookup the
+          apply step consults.
+        - `allocatedMaskVgprs` is the list the caller must
+          `vgprPool.checkIn` AFTER the per-mmak loop completes.
+
+    Reuses the static-skip (`ASEM*bpe % bpr == 0`) and runtime gate
+    (`LoopCounterL & (elementsPerVgpr-1)`) shape from
+    `_emitTailSubLaneMaskRefineSubtile` via the shared chain helper
+    `_emitTailSubLaneMaskChainIntoVgpr`. Idea ported from sebvince's
+    #7683 (`a0fee2619c Precompute mask for all subIterK`).
+    """
+    assert kernel["ProblemType"].get("MXBlockA", 0) == 0, (
+      "sub-lane K-tail mask precompute does not handle the MX scale path.")
+    assert kernel["ProblemType"].get("MXBlockB", 0) == 0, (
+      "sub-lane K-tail mask precompute does not handle the MX scale path.")
+
+    bpr = 4
+    bpeARaw = kernel["ProblemType"]["DataTypeA"].numBytes()
+    bpeBRaw = kernel["ProblemType"]["DataTypeB"].numBytes()
+    bpeA = int(bpeARaw)
+    bpeB = int(bpeBRaw)
+    assert bpeA == bpeARaw and 1 <= bpeA <= bpr, (
+      "sub-lane precompute: DataTypeA bpe must be integer in [1, bpr]; "
+      "got %r" % (bpeARaw,))
+    assert bpeB == bpeBRaw and 1 <= bpeB <= bpr, (
+      "sub-lane precompute: DataTypeB bpe must be integer in [1, bpr]; "
+      "got %r" % (bpeBRaw,))
+    elementsPerVgprA = max(1, bpr // bpeA)
+    elementsPerVgprB = max(1, bpr // bpeB)
+    vgprPerInUnrollA = max(1, numMIInUnroll // elementsPerVgprA)
+    vgprPerInUnrollB = max(1, numMIInUnroll // elementsPerVgprB)
+    shareAB = (bpeA == bpeB and elementsPerVgprA == elementsPerVgprB)
+
+    module = Module("tailSubLaneMaskPrecomputeSubtile")
+    maskVgprMap = {}
+    allocatedMaskVgprs = []
+
+    kPosCur = self.vgprPool.checkOut(1, "kPosCurPrecompute")
+    seedVgpr = self.vgprPool.checkOut(1, "subLaneByteSeedPrecompute")
+
+    for mmak in range(numMmaks):
+      for ir in range(vgprPerInUnrollA):
+        vMaskA = self.vgprPool.checkOut(
+          1, "subLaneMask_A_mmak%d_ir%d" % (mmak, ir))
+        allocatedMaskVgprs.append(vMaskA)
+        maskVgprMap[("A", mmak, ir)] = vMaskA
+        module.add(self._emitTailSubLaneMaskChainIntoVgpr(
+          kernel, "A", kPosBaseVgpr, mmak, ir, miK,
+          bpeA, elementsPerVgprA, vMaskA, kPosCur, seedVgpr))
+      if shareAB:
+        for ir in range(vgprPerInUnrollA):
+          maskVgprMap[("B", mmak, ir)] = maskVgprMap[("A", mmak, ir)]
+      else:
+        for ir in range(vgprPerInUnrollB):
+          vMaskB = self.vgprPool.checkOut(
+            1, "subLaneMask_B_mmak%d_ir%d" % (mmak, ir))
+          allocatedMaskVgprs.append(vMaskB)
+          maskVgprMap[("B", mmak, ir)] = vMaskB
+          module.add(self._emitTailSubLaneMaskChainIntoVgpr(
+            kernel, "B", kPosBaseVgpr, mmak, ir, miK,
+            bpeB, elementsPerVgprB, vMaskB, kPosCur, seedVgpr))
+
+    self.vgprPool.checkIn(kPosCur)
+    self.vgprPool.checkIn(seedVgpr)
+    return module, maskVgprMap, allocatedMaskVgprs
+
+
+  def _emitTailSubLaneMaskApplySubtile(self, mmak, maskVgprMap,
+                                       aIndicesByIr, bIndicesByIr):
+    """Per-mmak v_and-only apply step for precomputed K-tail masks.
+    Walks `aIndicesByIr` / `bIndicesByIr` (which still reflect the
+    per-mmak A/B vgprTile slice) and emits one
+    `v_and_b32 vIdx, maskVgprMap[(operand, mmak, ir)], vIdx`
+    per boundary VGPR. No cmps, no cndmasks: those were emitted once
+    in `_emitTailSubLaneMaskPrecomputeSubtile` before the loop.
+    """
+    module = Module("tailSubLaneMaskApplySubtile mmak=%u" % mmak)
+    for ir, idxs in sorted(aIndicesByIr.items()):
+      vMask = maskVgprMap.get(("A", mmak, ir))
+      assert vMask is not None, (
+        "missing precomputed A mask for mmak=%d ir=%d "
+        "(maskVgprMap keys=%r)" % (mmak, ir, sorted(maskVgprMap.keys())))
+      for vIdx in idxs:
+        module.add(VAndB32(
+          dst=vgpr(vIdx), src0=vgpr(vMask), src1=vgpr(vIdx),
+          comment="byteRefine[A ir=%d mmak=%d]: apply precomputed mask "
+                  "to ValuA[%u]" % (ir, mmak, vIdx)))
+    for ir, idxs in sorted(bIndicesByIr.items()):
+      vMask = maskVgprMap.get(("B", mmak, ir))
+      assert vMask is not None, (
+        "missing precomputed B mask for mmak=%d ir=%d "
+        "(maskVgprMap keys=%r)" % (mmak, ir, sorted(maskVgprMap.keys())))
+      for vIdx in idxs:
+        module.add(VAndB32(
+          dst=vgpr(vIdx), src0=vgpr(vMask), src1=vgpr(vIdx),
+          comment="byteRefine[B ir=%d mmak=%d]: apply precomputed mask "
+                  "to ValuB[%u]" % (ir, mmak, vIdx)))
+    return module
+
+
   @staticmethod
   def _subtileCmpSrc1FitsInline(value):
     """gfx950 VOPC / SOPC src1 inline-constant range.
@@ -4875,6 +5092,30 @@ class KernelWriter(metaclass=abc.ABCMeta):
         return tiMXSB.vgprTiles[MX_SCALE_TILES_PER_VGPR * scaleGroup].regList.indices[0] \
                if hasScaleB and tiMXSB.mxBlock else -1
 
+      # Precompute every per-(operand, mmak, ir) K-tail byte mask
+      # ONCE before the per-mmak loop runs (when the byte refine path
+      # applies and the precompute is enabled). The per-mmak loop
+      # then drops the cmp+cndmask chain in favour of a pure
+      # `v_and_b32 vIdx, vMask[..], vIdx` apply step. Persistent VGPR
+      # cost for the common bf16/bf16 case (shared A/B masks):
+      # `numMmaks * (numMIInUnroll // elementsPerVgpr)` (e.g. 8 vgprs
+      # on MT256/DU=64, scales linearly with DU); offset by removing
+      # the inline kPosCur+maskVgpr+seedVgpr scratch the legacy helper
+      # held per mmak iter and by hoisting `numMmaks` cmp+cndmask
+      # chains out of the loop.
+      #
+      # Gated by `SubtileTailMaskPrecompute` (default True). Set to
+      # False to fall back to the legacy per-mmak inline mask chain.
+      useMaskPrecompute = kernel.get("SubtileTailMaskPrecompute", True)
+      byteRefineApplies = self._subtileTailByteShiftApplies(kernel, numMIInUnroll)
+      precomputedMaskMap = None
+      precomputedMaskVgprs = []
+      if useMaskPrecompute and byteRefineApplies:
+        precomputeModule, precomputedMaskMap, precomputedMaskVgprs = \
+          self._emitTailSubLaneMaskPrecomputeSubtile(
+            kernel, kPosBaseVgpr, tiA.localMMATileGrid[1], miK, numMIInUnroll)
+        module.add(precomputeModule)
+
       laneSGPRCount = self.states.laneSGPRCount
       for mmak in range(tiA.localMMATileGrid[1]):
         # Per-mmak slice alloc + LR: pull only the current mmak's
@@ -4901,7 +5142,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         #     are never needed in this branch.
         #   - Coarse path (default): per-mmak cmp + per-VGPR
         #     cndmask, including MXSA/MXSB when scales are present.
-        if self._subtileTailByteShiftApplies(kernel, numMIInUnroll):
+        if byteRefineApplies:
           # Group A/B operand VGPRs by their ir slot within each
           # (mma0, mmak) / (mma1, mmak) tile; the byte refine emits
           # one mask chain per (ir, operand) so the dedup is keyed
@@ -4933,9 +5174,19 @@ class KernelWriter(metaclass=abc.ABCMeta):
                 continue
               seenBByteVgpr[vIdx] = ir
               bIndicesByIr.setdefault(ir, []).append(vIdx)
-          module.add(self._emitTailSubLaneMaskRefineSubtile(
-              kernel, kPosBaseVgpr, mmak, miK, numMIInUnroll,
-              aIndicesByIr, bIndicesByIr))
+          if useMaskPrecompute:
+            # Hot path: every cmp/cndmask was emitted up front into
+            # `precomputedMaskMap`; this per-mmak step is just
+            # `v_and_b32` against the precomputed VGPR.
+            module.add(self._emitTailSubLaneMaskApplySubtile(
+              mmak, precomputedMaskMap, aIndicesByIr, bIndicesByIr))
+          else:
+            # Legacy fallback (config-gated): emit the full chain
+            # inline per mmak. Kept so the precompute can be flipped
+            # off without reverting code.
+            module.add(self._emitTailSubLaneMaskRefineSubtile(
+                kernel, kPosBaseVgpr, mmak, miK, numMIInUnroll,
+                aIndicesByIr, bIndicesByIr))
         else:
           with self.allocTmpSgpr(laneSGPRCount,
                                  alignment=laneSGPRCount) as tmpSgprInfo:
@@ -5025,6 +5276,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
           module.add(SCBranchSCC1(
               labelName=Label.getFormatting("SkipTailLoop%s" % loopChar),
               comment="early-exit tail after subIterK=%u (no valid K left)" % mmak))
+
+      # Release the precomputed K-tail mask VGPRs (allocated once
+      # before the per-mmak loop; lived across every iter). The
+      # runtime per-mmak early-exit branches to `SkipTailLoopL` which
+      # sits past this cleanup, so emit-time pool accounting balances
+      # regardless of which branch fires at runtime.
+      for vMask in precomputedMaskVgprs:
+        self.vgprPool.checkIn(vMask)
+      precomputedMaskVgprs = []
+      precomputedMaskMap = None
 
       # Empty the now-unused A/B slot lists; the per-mmak alloc/free
       # pattern above already released every VGPR back to the pool.
