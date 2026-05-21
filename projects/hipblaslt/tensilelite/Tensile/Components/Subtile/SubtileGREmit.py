@@ -19,10 +19,9 @@
 import math
 from functools import singledispatch
 
-from rocisa.code import Label, Module
+from rocisa.code import Module
 from rocisa.container import DPPModifiers, EXEC, MUBUFModifiers, VCC, vgpr, sgpr, mgpr
 from rocisa.enum import RegisterType
-from rocisa.functions import vectorStaticDivide, vectorStaticRemainder
 from rocisa.instruction import (
     BufferLoadB128,
     SAddCU32, SAddU32, SAndB32, SBranch, SMovB32, SMovB64, SMulI32, SNop,
