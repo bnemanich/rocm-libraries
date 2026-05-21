@@ -4521,6 +4521,35 @@ class KernelWriter(metaclass=abc.ABCMeta):
     return module
 
 
+  @staticmethod
+  def _subtileCmpSrc1FitsInline(value):
+    """gfx950 VOPC / SOPC src1 inline-constant range.
+    Values outside [-16, 64] need either a 32-bit literal slot (which
+    some opcodes do not accept) or staging through an sgpr.
+    """
+    return -16 <= int(value) <= 64
+
+  def _emitSubtileScalarCmpLitOrStaged(self, cmpCls, src0, literal, comment):
+    """Emit `cmpCls src0, literal, ...` directly when `literal` fits
+    in the gfx950 inline-constant range, otherwise stage `literal`
+    into a scratch sgpr via `s_mov_b32` first and compare against the
+    sgpr. Returns a `Module` containing the emitted instruction(s).
+    Used by the K-tail scaffold (per-mmak early-exit threshold) where
+    the literal is `MIK * (subIterK + 1)` and grows past the inline
+    range for typical bf16 / FP4 fixtures.
+    """
+    sub = Module("subtileScalarCmpStaged")
+    if self._subtileCmpSrc1FitsInline(literal):
+      sub.add(cmpCls(src0=src0, src1=hex(int(literal)), comment=comment))
+    else:
+      with self.allocTmpSgpr(1) as litSgprInfo:
+        litSgpr = litSgprInfo.idx
+        sub.add(SMovB32(
+          dst=sgpr(litSgpr), src=hex(int(literal)),
+          comment="stage literal %d (non-inline) for cmp src1" % int(literal)))
+        sub.add(cmpCls(src0=src0, src1=sgpr(litSgpr), comment=comment))
+    return sub
+
   def _emitTailLoopScaffoldSubtile(self, kernel, tensorParametersA, tensorParametersB):
     """Subtile-path tail-loop scaffold (PGR=0 and PGR>0).
 
@@ -4982,9 +5011,17 @@ class KernelWriter(metaclass=abc.ABCMeta):
         # covers it.
         if mmak + 1 < tiA.localMMATileGrid[1]:
           consumedK = miK * (mmak + 1)
-          module.add(SCmpLeU32(
-              src0=sgpr("LoopCounterL"), src1=hex(consumedK),
-              comment="LoopCounterL <= MIK*(subIterK+1)?"))
+          # gfx950 scalar/vector cmp src1 has a -16..64 inline-constant
+          # range; values past that need a 32-bit literal slot which the
+          # assembler can reject (or silently mis-encode) for some VOPC
+          # / SOPC opcodes. Stage out-of-range literals through a
+          # scratch sgpr so the cmp always sees an inline-or-sgpr src1.
+          # For the per-mmak early exit specifically, MIK*(subIterK+1)
+          # exceeds 64 for typical bf16 (MIK=32) once subIterK>=2 and
+          # for FP4 (MIK=128) at every mmak>=0.
+          module.add(self._emitSubtileScalarCmpLitOrStaged(
+              SCmpLeU32, sgpr("LoopCounterL"), consumedK,
+              "LoopCounterL <= MIK*(subIterK+1)?"))
           module.add(SCBranchSCC1(
               labelName=Label.getFormatting("SkipTailLoop%s" % loopChar),
               comment="early-exit tail after subIterK=%u (no valid K left)" % mmak))

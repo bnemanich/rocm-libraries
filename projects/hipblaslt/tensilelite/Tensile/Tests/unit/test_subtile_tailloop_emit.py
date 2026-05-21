@@ -149,6 +149,51 @@ def _emit_tail_loop_asm(*, fp4: bool, no_tail_loop: bool, pgr: int) -> str:
     return wrap_with_skiptoend(module)
 
 
+def _collect_per_mmak_early_exit_thresholds(tail: str):
+    """Walk the tail asm in order and return the `MIK*(subIterK+1)`
+    threshold value for each per-mmak early-exit cmp, in emission
+    order. Accepts both forms emitted by
+    `_emitSubtileScalarCmpLitOrStaged`:
+
+      * Inline (threshold in [-16..64]):
+          `s_cmp_le_u32 ..., 0xN ... MIK*(subIterK+1)?`
+      * Staged (threshold > 64 or < -16):
+          `s_mov_b32 sN, 0xT ... stage literal T (non-inline) for cmp src1`
+          `s_cmp_le_u32 ..., sN ... MIK*(subIterK+1)?`
+
+    Pairs each cmp with its immediately-preceding staging mov by
+    matching sgpr name (so a future ordering change doesn't silently
+    cross-pair).
+    """
+    thresholds = []
+    pending_stage = {}  # sgpr name -> staged literal value
+    for line in tail.split("\n"):
+        m_stage = re.search(
+            r"s_mov_b32\s+s(\d+)\s*,\s*(0x[0-9a-fA-F]+)[^\n]*"
+            r"stage literal\s+(-?\d+)\s+\(non-inline\) for cmp src1", line)
+        if m_stage:
+            pending_stage["s" + m_stage.group(1)] = int(m_stage.group(2), 0)
+            continue
+        if "MIK*(subIterK+1)" not in line:
+            continue
+        m_inline = re.search(
+            r"s_cmp_le_u32[^\n]*sgprLoopCounterL[^\n]*,\s*(0x[0-9a-fA-F]+)",
+            line)
+        if m_inline:
+            thresholds.append(int(m_inline.group(1), 0))
+            continue
+        m_staged = re.search(
+            r"s_cmp_le_u32[^\n]*sgprLoopCounterL[^\n]*,\s*(s\d+)\b", line)
+        assert m_staged, "per-mmak cmp didn't match inline or staged form: %r" % line
+        sg = m_staged.group(1)
+        assert sg in pending_stage, (
+            "per-mmak cmp references %s but no preceding "
+            "`stage literal ... (non-inline) for cmp src1` s_mov_b32 "
+            "was found for it.\nLine: %r" % (sg, line))
+        thresholds.append(pending_stage.pop(sg))
+    return thresholds
+
+
 def _extract_tail_section(asm: str) -> str:
     """Extract the tail-loop section of the emitted asm.
 
@@ -539,12 +584,16 @@ class TestTailEmitContent_PGR0:
         `MIK * (subIterK + 1)`, so the threshold strictly increases
         with subIterK. Pins the formula rather than a fixed value
         (so future tile-grid changes don't silently corrupt it).
+
+        gfx950 VOPC/SOPC inline-constant range is -16..64, so a
+        threshold > 64 (FP4 MIK=128 hits every entry) is staged via
+        `s_mov_b32 sN, <lit> ... stage literal <lit> (non-inline) for
+        cmp src1` immediately before the cmp; thresholds in range
+        appear directly as a hex literal in the cmp's src1.
         """
         tail = _extract_tail_section(fp4_pgr0_asm)
         assert tail
-        thresholds = [int(t, 0) for t in re.findall(
-            r"s_cmp_le_u32[^\n]*sgprLoopCounterL[^\n]*,\s*(0x[0-9a-fA-F]+)"
-            r"[^\n]*MIK\*\(subIterK\+1\)", tail)]
+        thresholds = _collect_per_mmak_early_exit_thresholds(tail)
         assert thresholds, (
             "Tail must emit at least one per-mmak `s_cmp_le_u32 LoopCounterL, "
             "MIK*(subIterK+1)`"
@@ -589,6 +638,101 @@ class TestTailEmitContent_PGR0:
             r"s_cmp_le_u32[^\n]*sgprLoopCounterL[^\n]*MIK\*\(subIterK\+1\)",
             asm
         ), "NoTailLoop must not emit per-mmak early exits"
+
+    def test_per_mmak_early_exit_inline_when_consumedK_fits(self, bf16_pgr0_asm):
+        """BF16 fixture has MIK=32, DepthU=64 -> the only per-mmak
+        threshold is `32 * 1 = 32`, which fits the gfx950 inline range
+        [-16..64]. The scaffold must emit the cmp with the literal
+        directly in src1 -- NO staging `s_mov_b32 sN, 0x20 ... stage
+        literal ... for cmp src1` should appear before the cmp.
+        """
+        tail = _extract_tail_section(bf16_pgr0_asm)
+        assert tail
+        thresholds = _collect_per_mmak_early_exit_thresholds(tail)
+        assert thresholds == [32], (
+            "BF16 fixture expected one cmp at consumedK=32. Got %r" % (thresholds,)
+        )
+        assert not re.search(
+            r"s_mov_b32[^\n]*stage literal\s+32\s+\(non-inline\)", tail), (
+            "consumedK=32 fits the gfx950 inline range; the scaffold "
+            "must NOT stage it through a scratch sgpr."
+        )
+        assert re.search(
+            r"s_cmp_le_u32[^\n]*sgprLoopCounterL[^\n]*,\s*0x20\b"
+            r"[^\n]*MIK\*\(subIterK\+1\)", tail), (
+            "consumedK=32 must appear as a direct inline literal 0x20 "
+            "in the s_cmp_le_u32 src1."
+        )
+
+    def test_per_mmak_early_exit_staged_when_consumedK_exceeds_inline(self, fp4_pgr0_asm):
+        """FP4 fixture has MIK=128 -> every per-mmak threshold is
+        128, 256, ... (all > 64). The scaffold must stage each via
+        `s_mov_b32 sN, 0xT ... stage literal T (non-inline) for cmp
+        src1` before the cmp, and the cmp's src1 must reference an
+        sgpr (not a raw literal).
+        """
+        tail = _extract_tail_section(fp4_pgr0_asm)
+        assert tail
+        cmpLines = [ln for ln in tail.split("\n")
+                    if "MIK*(subIterK+1)" in ln and "s_cmp_le_u32" in ln]
+        assert cmpLines, "Expected at least one per-mmak early-exit cmp in FP4 tail"
+        for ln in cmpLines:
+            assert re.search(
+                r"s_cmp_le_u32[^\n]*sgprLoopCounterL[^\n]*,\s*s\d+\b", ln), (
+                "FP4 per-mmak early-exit cmp must use a staged sgpr "
+                "(consumedK >= 128 exceeds the gfx950 inline range).\n"
+                "Got: %r" % ln
+            )
+        stageCount = len(re.findall(
+            r"s_mov_b32[^\n]*stage literal\s+\d+\s+\(non-inline\) for cmp src1",
+            tail))
+        assert stageCount == len(cmpLines), (
+            "Each staged cmp must have exactly one preceding `stage "
+            "literal ... (non-inline) for cmp src1` s_mov_b32. "
+            "Got %d stages for %d cmps." % (stageCount, len(cmpLines))
+        )
+
+    def test_per_mmak_early_exit_boundary_consumedK_64(self):
+        """Direct-vs-staged boundary: consumedK == 64 sits at the high
+        end of the gfx950 inline range and must remain inline. Drives
+        a custom bf16 fixture with DU=128 -> mmak ∈ {0,1,2,3} so the
+        first non-final boundary (mmak=0 -> consumedK=32) and the
+        second (mmak=1 -> consumedK=64) both fit inline, while
+        mmak>=2 (consumedK >= 96) must stage. Pins that 64 is treated
+        as the inclusive upper bound.
+        """
+        kernel = _create_kernel(MT0=256, MT1=256, fp4=False, depthU=128,
+                                no_tail_loop=False)
+        _augment_kernel_for_tail_scaffold(kernel, pgr=0)
+        kwa = _build_minimal_kwa(kernel)
+        tPA = {"is_sparse": False, "tpsMetadata": None}
+        tPB = {"is_sparse": False, "tpsMetadata": None}
+        module = kwa._emitTailLoopScaffoldSubtile(kernel, tPA, tPB)
+        tail = _extract_tail_section(wrap_with_skiptoend(module))
+        assert tail
+        thresholds = _collect_per_mmak_early_exit_thresholds(tail)
+        # DU=128, MIK=32 -> 4 mmaks -> 3 non-final boundaries:
+        #   consumedK = 32, 64, 96.
+        assert thresholds == [32, 64, 96], (
+            "Expected DU=128 bf16 fixture to emit 3 per-mmak early "
+            "exits at consumedK in {32,64,96}; got %r" % (thresholds,)
+        )
+        # 32 and 64 must NOT be staged; 96 MUST be staged.
+        assert not re.search(
+            r"s_mov_b32[^\n]*stage literal\s+32\s+\(non-inline\)", tail), (
+            "consumedK=32 must not be staged (inline range)."
+        )
+        assert not re.search(
+            r"s_mov_b32[^\n]*stage literal\s+64\s+\(non-inline\)", tail), (
+            "consumedK=64 must not be staged: 64 is the inclusive "
+            "upper bound of the gfx950 inline-constant range."
+        )
+        assert re.search(
+            r"s_mov_b32[^\n]*stage literal\s+96\s+\(non-inline\) for cmp src1",
+            tail), (
+            "consumedK=96 exceeds the gfx950 inline range and must be "
+            "staged through a scratch sgpr."
+        )
 
 
 # ── Tests: PGR=2 ─────────────────────────────────────────────────────────────
