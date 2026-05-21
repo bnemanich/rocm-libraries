@@ -4365,10 +4365,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     Static skip: when `ASEM*bpe % bpr == 0` (K_remain in bytes is a
     multiple of a register), only the mod=0 step is reachable and
-    the mod>0 chain collapses. Runtime gate: when not statically
-    skippable, an `s_and ..., LoopCounterL, (elementsPerVgpr-1)`
-    test branches around the mod>0 chain when K_remain happens to
-    align at runtime. The mod=0 step is always emitted (it's the
+    the mod>0 chain collapses. Otherwise the full mod chain is
+    emitted unconditionally -- the mod>0 chain is short (4 instr
+    per step for bf16, 12 total for fp8) and per nakajee #PR-review
+    the 3-instr scalar runtime gate to skip it is not worth the
+    branch overhead in the precompute path (this chain runs ONCE
+    per (operand, mmak, ir) before the per-mmak MFMA loop, not in
+    the hot path). The mod=0 step is always emitted (it's the
     "this VGPR is entirely past LoopCounterL" case the coarse
     cndmask used to handle and that #5 lets the byte refine own).
 
@@ -4425,23 +4428,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         dst=vgpr(maskVgpr), src=hex(0xFFFFFFFF),
         comment="byteRefine[%s ir=%d mmak=%d]: mask seed = full keep"
                 % (operand, ir, mmak)))
-      partialSkipLabel = None
       if not staticSkipPartial:
-        partialSkipLabel = Label(self.labels.getUniqueNamePrefix(
-          "SubtileTailByteShiftPartialSkip"),
-          comment="K_remain partial-mod aligned: skip mod>0 mask chain")
-        with self.allocTmpSgpr(1) as gateInfo:
-          gateSgpr = gateInfo.idx
-          module.add(SAndB32(
-            dst=sgpr(gateSgpr), src0=sgpr("LoopCounterL"),
-            src1=hex(elementsPerVgpr - 1),
-            comment="LoopCounterL & (elementsPerVgpr-1) = partial-mod residue"))
-          module.add(SCmpEQU32(
-            src0=sgpr(gateSgpr), src1=0,
-            comment="K_remain partial-mod aligned ?"))
-          module.add(SCBranchSCC1(
-            labelName=partialSkipLabel.getLabelName(),
-            comment="skip mod>0 chain on aligned K_remain"))
         with self.allocTmpSgpr(laneSGPRCount,
                                alignment=laneSGPRCount) as maskInfo:
           maskSgpr = maskInfo.idx
@@ -4449,7 +4436,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
           # mask down to `(1 << (mod*bpe*8)) - 1` on past-boundary
           # lanes, leaving in-range lanes unchanged. The mod=0 step
           # below is statically reachable so it lives outside this
-          # runtime-gated block.
+          # block.
           for mod in range(elementsPerVgpr - 1, 0, -1):
             maskByte = (1 << (mod * bpe * 8)) - 1
             # The past-boundary mask byte lives in src1 of cndmask,
@@ -4475,7 +4462,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
               src2=sgpr(maskSgpr, laneSGPRCount),
               comment="byteRefine[%s ir=%d mod=%d]: mask = past ? 0x%X : prev"
                       % (operand, ir, mod, maskByte)))
-        module.add(partialSkipLabel)
 
       # mod=0: lanes whose K-position is at or past LoopCounterL get
       # mask = 0 (entire VGPR zeroed by the v_and below). Always
@@ -4527,8 +4513,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
     """Emit ONE per-(operand, mmak, ir) byte-mask chain into
     `targetMaskVgpr`. Mirrors the chain body from
     `_emitTailSubLaneMaskRefineSubtile._emitChain` (static skip +
-    runtime gate + mod>0 chain + mod=0 step) but writes its result to
-    a caller-owned VGPR instead of v_anding it back into A/B tile
+    mod>0 chain + mod=0 step) but writes its result to a
+    caller-owned VGPR instead of v_anding it back into A/B tile
     VGPRs. The apply step (`_emitTailSubLaneMaskApplySubtile`) does
     the v_and per (operand, ir, vIdx).
 
@@ -4549,21 +4535,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
               % (operand, ir, mmak)))
 
     if not staticSkipPartial:
-      partialSkipLabel = Label(self.labels.getUniqueNamePrefix(
-        "SubtileTailByteShiftPartialSkip"),
-        comment="K_remain partial-mod aligned: skip mod>0 mask chain")
-      with self.allocTmpSgpr(1) as gateInfo:
-        gateSgpr = gateInfo.idx
-        module.add(SAndB32(
-          dst=sgpr(gateSgpr), src0=sgpr("LoopCounterL"),
-          src1=hex(elementsPerVgpr - 1),
-          comment="LoopCounterL & (elementsPerVgpr-1) = partial-mod residue"))
-        module.add(SCmpEQU32(
-          src0=sgpr(gateSgpr), src1=0,
-          comment="K_remain partial-mod aligned ?"))
-        module.add(SCBranchSCC1(
-          labelName=partialSkipLabel.getLabelName(),
-          comment="skip mod>0 chain on aligned K_remain"))
       with self.allocTmpSgpr(laneSGPRCount,
                              alignment=laneSGPRCount) as maskInfo:
         maskSgpr = maskInfo.idx
@@ -4589,7 +4560,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
             src2=sgpr(maskSgpr, laneSGPRCount),
             comment="byteRefine[%s ir=%d mod=%d]: mask = past ? 0x%X : prev"
                     % (operand, ir, mod, maskByte)))
-      module.add(partialSkipLabel)
 
     kElemOffset0 = mmak * miK + ir * elementsPerVgpr
     module.add(VAddU32(

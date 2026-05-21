@@ -346,19 +346,16 @@ class TestAnyKEmit_K2:
 
 class TestAnyKEmit_K1:
     """ASEM=1 (odd K). `ASEM*bpe = 2` is not a multiple of `bpr = 4`,
-    so the mod>0 partial chain is emitted under a runtime gate
-    `s_and ..., LoopCounterL, (elementsPerVgpr-1)` per (operand, ir)
-    chain. The chain shape is:
+    so the mod>0 partial chain is emitted unconditionally (no runtime
+    s_and/s_cbranch gate -- per nakajee #PR-review the 3-instr scalar
+    gate to skip a 4-instr chain in the one-shot precompute setup is
+    not worth the branch overhead). The chain shape is:
 
       v_mov_b32 vMask, 0xFFFFFFFF                         // mask seed
-      s_and_b32 sGate, sgprLoopCounterL, (elementsPerVgpr-1)
-      s_cmp_eq_u32 sGate, 0
-      s_cbranch_scc1 SubtileTailByteShiftPartialSkip_*
       v_mov_b32 vSeed, 0xFFFF                             // mod=1 keep
       v_add_u32 vKpos, mod=1 offset, kPosBase
       v_cmp_ge_i32 sMask, vKpos, sgprLoopCounterL
       v_cndmask_b32 vMask, vMask, vSeed, sMask
-    SubtileTailByteShiftPartialSkip_*:
       v_add_u32 vKpos, mod=0 offset, kPosBase
       v_cmp_ge_i32 sMask, vKpos, sgprLoopCounterL
       v_cndmask_b32 vMask, vMask, 0, sMask
@@ -379,23 +376,23 @@ class TestAnyKEmit_K1:
             "`buffer_load_*_d16 ... lds` is not legal on gfx950."
         )
 
-        # Runtime gate skip label.
-        assert re.search(
-            r"label_SubtileTailByteShiftPartialSkip", tail
-        ), (
-            "ASEM=1 emit missing partial-mod runtime gate skip "
-            "label `SubtileTailByteShiftPartialSkip*`."
+        # Runtime gate must NOT be emitted (removed per nakajee
+        # #PR-review): no skip label, no partial-mod residue compute,
+        # no s_cbranch_scc1 around the mod>0 chain.
+        assert "SubtileTailByteShiftPartialSkip" not in tail, (
+            "ASEM=1 emit must NOT contain the legacy runtime "
+            "partial-mod skip label (removed -- 3-instr scalar gate "
+            "to skip 4-instr mod>0 chain is not worth the branch "
+            "overhead in a one-shot precompute setup)."
         )
-        # Runtime gate `s_and ..., LoopCounterL, 0x1` (elementsPerVgpr=2).
-        gate_match = re.search(
+        assert re.search(
             r"s_and_b32[^\n]*LoopCounterL[^\n]*0x1"
             r"[^\n]*partial-mod residue",
             tail,
-        )
-        assert gate_match is not None, (
-            "ASEM=1 emit missing `s_and_b32 sGate, "
-            "sgprLoopCounterL, 0x1` partial-mod residue gate. "
-            "Tail excerpt:\n" + tail[:2000]
+        ) is None, (
+            "ASEM=1 emit must NOT compute the runtime partial-mod "
+            "residue `s_and_b32 sGate, sgprLoopCounterL, 0x1` "
+            "(runtime gate removed)."
         )
 
         # Per-mod=1 keep-mask seed `v_mov_b32 vSeed, 0xFFFF`.
@@ -456,19 +453,21 @@ class TestAnyKEmit_K1:
             "application. Tail excerpt:\n" + tail[:2000]
         )
 
-        # ASEM=1 partial chain runs UNDER the runtime gate inside
-        # the precompute block (before any per-mmak ds_read wait).
-        # The runtime gate label and mod=1 keep-mask seed must
-        # appear in the precompute prefix, not in the per-mmak
+        # ASEM=1 partial chain runs INSIDE the precompute block
+        # (before any per-mmak ds_read wait): mod=1 keep-mask seed
+        # must appear in the precompute prefix, not in the per-mmak
         # apply step.
         ds_wait_idx = tail.find("tail LR mmak=0: wait for ds_reads")
         assert ds_wait_idx > 0, (
             "ASEM=1 emit missing per-mmak `tail LR mmak=0: wait for "
             "ds_reads` marker."
         )
-        gate_pos = tail.find("partial-mod residue")
-        assert 0 < gate_pos < ds_wait_idx, (
-            "ASEM=1 emit must place the partial-mod runtime gate "
+        keep_mod1_pos = re.search(
+            r"v_mov_b32\s+v\d+,\s*0xffff\b[^\n]*mod=1[^\n]*keep mask",
+            tail, re.IGNORECASE,
+        ).start()
+        assert 0 < keep_mod1_pos < ds_wait_idx, (
+            "ASEM=1 emit must place the mod=1 keep-mask seed "
             "INSIDE the precompute block (before the first per-mmak "
             "ds_read wait)."
         )
