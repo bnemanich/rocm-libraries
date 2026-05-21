@@ -4996,6 +4996,38 @@ class KernelWriter(metaclass=abc.ABCMeta):
                                         tmpSgprInfo,
                                         "kPosBase = tidInK * numMIInUnroll (K-element base)"))
 
+      # Precompute every per-(operand, mmak, ir) K-tail byte mask
+      # ONCE before the swait+sbarrier below (when the byte refine
+      # path applies and the precompute is enabled). The mask chain
+      # only reads `LoopCounterL` and `kPosBaseVgpr` -- it does NOT
+      # consume any DTL/LDS data -- so hoisting it above the
+      # `tail GR: wait for DTL writes to LDS` drain lets the
+      # cmp/cndmask chain co-issue with the buffer-load latency
+      # rather than serializing behind it (per nakajee #PR-review).
+      #
+      # The per-mmak loop below collapses to a pure
+      # `v_and_b32 vIdx, vMask[..], vIdx` apply step. Persistent
+      # VGPR cost for the common bf16/bf16 case (shared A/B masks):
+      # `numMmaks * (numMIInUnroll // elementsPerVgpr)` (e.g. 8 vgprs
+      # on MT256/DU=64, scales linearly with DU); offset by removing
+      # the inline kPosCur+maskVgpr+seedVgpr scratch the legacy helper
+      # held per mmak iter and by hoisting `numMmaks` cmp+cndmask
+      # chains out of the loop.
+      #
+      # Gated by `SubtileTailMaskPrecompute` (default True). Set to
+      # False to fall back to the legacy per-mmak inline mask chain.
+      useMaskPrecompute = kernel.get("SubtileTailMaskPrecompute", True)
+      byteRefineApplies = self._subtileTailByteShiftApplies(kernel, numMIInUnroll)
+      precomputedMaskMap = None
+      precomputedMaskVgprs = []
+      if useMaskPrecompute and byteRefineApplies:
+        precomputeModule, precomputedMaskMap, precomputedMaskVgprs = \
+          self._emitTailSubLaneMaskPrecomputeSubtile(
+            kernel, kPosBaseVgpr,
+            self.states.a.tileInfo.localMMATileGrid[1],
+            kernel["MatrixInstK"], numMIInUnroll)
+        module.add(precomputeModule)
+
       module.add(SWaitCnt(vlcnt=0, vscnt=-1,
                           comment="tail GR: wait for DTL writes to LDS"))
       module.add(SBarrier(comment="tail GR: LDS sync before LR"))
@@ -5061,30 +5093,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
         scaleGroup = (mma1_ // 2) * subtileKGrid + mmak_ // subtileKShape
         return tiMXSB.vgprTiles[MX_SCALE_TILES_PER_VGPR * scaleGroup].regList.indices[0] \
                if hasScaleB and tiMXSB.mxBlock else -1
-
-      # Precompute every per-(operand, mmak, ir) K-tail byte mask
-      # ONCE before the per-mmak loop runs (when the byte refine path
-      # applies and the precompute is enabled). The per-mmak loop
-      # then drops the cmp+cndmask chain in favour of a pure
-      # `v_and_b32 vIdx, vMask[..], vIdx` apply step. Persistent VGPR
-      # cost for the common bf16/bf16 case (shared A/B masks):
-      # `numMmaks * (numMIInUnroll // elementsPerVgpr)` (e.g. 8 vgprs
-      # on MT256/DU=64, scales linearly with DU); offset by removing
-      # the inline kPosCur+maskVgpr+seedVgpr scratch the legacy helper
-      # held per mmak iter and by hoisting `numMmaks` cmp+cndmask
-      # chains out of the loop.
-      #
-      # Gated by `SubtileTailMaskPrecompute` (default True). Set to
-      # False to fall back to the legacy per-mmak inline mask chain.
-      useMaskPrecompute = kernel.get("SubtileTailMaskPrecompute", True)
-      byteRefineApplies = self._subtileTailByteShiftApplies(kernel, numMIInUnroll)
-      precomputedMaskMap = None
-      precomputedMaskVgprs = []
-      if useMaskPrecompute and byteRefineApplies:
-        precomputeModule, precomputedMaskMap, precomputedMaskVgprs = \
-          self._emitTailSubLaneMaskPrecomputeSubtile(
-            kernel, kPosBaseVgpr, tiA.localMMATileGrid[1], miK, numMIInUnroll)
-        module.add(precomputeModule)
 
       laneSGPRCount = self.states.laneSGPRCount
       for mmak in range(tiA.localMMATileGrid[1]):

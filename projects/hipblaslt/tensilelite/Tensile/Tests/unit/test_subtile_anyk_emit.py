@@ -577,6 +577,56 @@ class TestAnyKEmit_Precompute:
             "v_mov (hoisted out into the precompute block)."
         )
 
+    def test_precompute_hoisted_above_dtl_wait_and_barrier(self):
+        """The K-tail mask precompute reads only `LoopCounterL` and
+        `kPosBaseVgpr`; it does NOT consume any DTL/LDS data. To let
+        the cmp/cndmask chain co-issue with the buffer-load latency
+        the precompute must be emitted ABOVE the
+        `tail GR: wait for DTL writes to LDS` swait + the
+        `tail GR: LDS sync before LR` barrier (rather than
+        serializing behind them). Tests both ASEM=1 (full mod>0
+        chain) and ASEM=2 (statically-skipped mod>0 chain, mod=0 only).
+        """
+        for asem in (1, 2):
+            tail = _extract_tail_section(_emit_anyk_tail_asm(asem=asem, pgr=0))
+            assert tail, "ASEM=%d emit produced no tail block" % asem
+
+            dtl_wait_marker = "tail GR: wait for DTL writes to LDS"
+            barrier_marker = "tail GR: LDS sync before LR"
+            dtl_wait_idx = tail.find(dtl_wait_marker)
+            barrier_idx = tail.find(barrier_marker)
+            assert dtl_wait_idx > 0, (
+                "ASEM=%d emit missing `%s` swait marker"
+                % (asem, dtl_wait_marker))
+            assert barrier_idx > dtl_wait_idx, (
+                "ASEM=%d emit missing `%s` barrier after swait"
+                % (asem, barrier_marker))
+
+            seed_pos = tail.find("byteRefine[A ir=0 mmak=0]: mask seed")
+            assert seed_pos > 0, (
+                "ASEM=%d emit missing byteRefine seed comment"
+                % asem)
+            assert seed_pos < dtl_wait_idx, (
+                "ASEM=%d emit must hoist byteRefine seed (chain "
+                "start) ABOVE the `%s` swait so cmp/cndmask can "
+                "co-issue with the buffer-load latency.\n"
+                "seed@%d, dtl_wait@%d"
+                % (asem, dtl_wait_marker, seed_pos, dtl_wait_idx))
+
+            # Every cmp on LoopCounterL in the byteRefine chain
+            # must precede the DTL wait too (the chain is contiguous
+            # from seed → cmps → cndmasks).
+            for m in re.finditer(
+                r"v_cmp_ge_i32[^\n]*LoopCounterL[^\n]*byteRefine",
+                tail,
+            ):
+                assert m.start() < dtl_wait_idx, (
+                    "ASEM=%d emit has a byteRefine `v_cmp_ge_i32 "
+                    "..., LoopCounterL` at offset %d AFTER the DTL "
+                    "wait at offset %d -- the precompute chain "
+                    "must be fully hoisted above the wait."
+                    % (asem, m.start(), dtl_wait_idx))
+
     def test_precompute_shares_mask_vgpr_between_A_and_B(self):
         """bf16/bf16 has bpeA==bpeB so the per-(mmak, ir) mask is
         identical for A and B; the precompute must allocate ONE
