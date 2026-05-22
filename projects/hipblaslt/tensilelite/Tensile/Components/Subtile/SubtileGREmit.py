@@ -24,8 +24,7 @@ from rocisa.container import DPPModifiers, EXEC, MUBUFModifiers, VCC, vgpr, sgpr
 from rocisa.enum import RegisterType
 from rocisa.instruction import (
     BufferLoadB128,
-    SAddCU32, SAddU32, SAndB32, SBranch, SMovB32, SMovB64, SMulI32, SNop,
-    SXorB32,
+    SAddCU32, SAddU32, SMovB32, SMovB64, SMulI32, SNop, SXorB32,
     VAddU32, VAndB32, VCmpXEqU32,
     VLShiftLeftB32, VLShiftRightB32, VMovB32,
     VMulLOU32, VReadfirstlaneB32, VSubU32,
