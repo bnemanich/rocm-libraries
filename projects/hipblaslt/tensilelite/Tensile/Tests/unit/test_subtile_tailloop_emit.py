@@ -1287,3 +1287,155 @@ class TestTailSrdTightenSubtile:
             "before the tightening fires. entry=%d, srdA=%d"
             % (entry_pos, srdA_match.start())
         )
+
+
+# ── Tests: MX scale Srd<MXS{A,B}>+2 tightening (DepthU > 256) ────────────────
+
+class TestTailSrdTightenSubtileMX:
+    """`_emitTailSrdTightenSubtileMX` emit shape.
+
+    Per nakajee #PR-7661 spec the MX scale SRD+2 needs an extra
+    tightening step at tail entry when `DepthU > 256` (= MX K-padding
+    unit). For `DepthU <= 256` the host's
+    `rearrangePaddedMXScaleLayout` already pads K-blocks out to the
+    next 256-K boundary, so the natural NumRecords already covers any
+    K_remain on the last m-row -- the MX helper must be a static
+    no-op (no instructions, no comments).
+
+    For `DepthU > 256` (only `DepthU=512` in our current MX yaml
+    gauntlet), the helper emits a roundUp(K_remain, 256) chain plus
+    `s_sub_u32 SrdMXS{A,B}+2, -, <delta_K>`. `bytesPerKElement_MX`
+    is 1 for all current MXSA_B4/MXSB_B4/MXSA_B8/MXSB_B8 layouts so
+    the K-element delta is applied directly without scaling.
+    """
+
+    def _emit_fp4_asm(self, *, depthU, pgr=0):
+        kernel = _create_kernel(256, 256, fp4=True, depthU=depthU,
+                                no_tail_loop=False)
+        _augment_kernel_for_tail_scaffold(kernel, pgr)
+        kwa = _build_minimal_kwa(kernel)
+        tPA = {"is_sparse": False, "tpsMetadata": None}
+        tPB = {"is_sparse": False, "tpsMetadata": None}
+        module = kwa._emitTailLoopScaffoldSubtile(kernel, tPA, tPB)
+        return wrap_with_skiptoend(module)
+
+    def test_mx_tighten_static_noop_when_depthU_eq_padK(self):
+        """`DepthU == 256` is the boundary case: every K_remain in
+        [1, 255] rounds up to 256 = DepthU, so delta_K = 0 always.
+        The helper must short-circuit (emit nothing) -- no banner,
+        no SrdMXSA/B+2 sub, no temp sgpr alloc.
+        """
+        asm = self._emit_fp4_asm(depthU=256)
+        tail = _extract_tail_section(asm)
+        assert tail, "fp4 fixture must produce a tail body"
+        assert "MX follow-up" not in tail, (
+            "DepthU=256 must NOT emit the MX SRD tighten banner "
+            "(static no-op: K_remain < 256 == padK already covered "
+            "by host padding)."
+        )
+        assert not re.search(r"s_sub_u32[^\n]*SrdMXSA\+2", tail), (
+            "DepthU=256 must NOT emit `s_sub_u32 SrdMXSA+2` (static "
+            "no-op)."
+        )
+        assert not re.search(r"s_sub_u32[^\n]*SrdMXSB\+2", tail), (
+            "DepthU=256 must NOT emit `s_sub_u32 SrdMXSB+2` (static "
+            "no-op)."
+        )
+
+    def test_mx_tighten_emits_when_depthU_gt_padK(self):
+        """`DepthU=512` exceeds the MX K-padding unit (256), so the
+        helper must emit the roundUp chain and the SrdMXSA+2 /
+        SrdMXSB+2 sub. Pin the full chain: banner, roundUp
+        precompute, delta = DepthU - remainK_MX, and per-operand
+        sub.
+        """
+        asm = self._emit_fp4_asm(depthU=512)
+        tail = _extract_tail_section(asm)
+        assert tail
+        assert "MX follow-up" in tail, (
+            "DepthU=512 fp4 tail must emit the MX SRD tighten banner. "
+            "Tail head:\n" + tail[:2500]
+        )
+        assert re.search(
+            r"s_add_u32\s+s\[?\d+\]?,\s*s\[sgprLoopCounterL\]\s*,\s*255\b"
+            r"[^\n]*K_remain \+ \(MX_pad_K - 1\)",
+            tail
+        ), (
+            "DepthU=512 tail must add (256-1)=255 to LoopCounterL for "
+            "the MX roundUp chain"
+        )
+        assert re.search(
+            r"s_and_b32\s+s\[?\d+\]?,\s*s\[?\d+\]?,\s*0xffffff00\b"
+            r"[^\n]*remainK_MX = roundUp\(K_remain, 256\)",
+            tail
+        ), (
+            "DepthU=512 tail must mask with 0xffffff00 to align K to "
+            "256-element MX padding boundary"
+        )
+        assert re.search(
+            r"s_sub_u32\s+s\[?\d+\]?,\s*(?:512|0x200)\s*,\s*s\[?\d+\]?"
+            r"[^\n]*delta_K = DepthU - remainK_MX",
+            tail
+        ), (
+            "DepthU=512 tail must precompute `delta_K = 512 - remainK_MX`"
+        )
+        assert re.search(
+            r"s_sub_u32\s+s\[sgprSrdMXSA\+2\]\s*,\s*s\[sgprSrdMXSA\+2\]"
+            r"\s*,\s*s\[?\d+\]?[^\n]*SrdMXSA\+2 -= delta",
+            tail
+        ), "DepthU=512 tail must subtract delta from SrdMXSA+2"
+        assert re.search(
+            r"s_sub_u32\s+s\[sgprSrdMXSB\+2\]\s*,\s*s\[sgprSrdMXSB\+2\]"
+            r"\s*,\s*s\[?\d+\]?[^\n]*SrdMXSB\+2 -= delta",
+            tail
+        ), "DepthU=512 tail must subtract delta from SrdMXSB+2"
+
+    def test_mx_tighten_skipped_for_non_mx(self):
+        """Non-MX (bf16) kernels must NOT emit the MX SRD tighten
+        helper regardless of DepthU.
+        """
+        asm = _emit_tail_loop_asm(fp4=False, no_tail_loop=False, pgr=0)
+        tail = _extract_tail_section(asm)
+        assert tail
+        assert "MX follow-up" not in tail, (
+            "Non-MX (bf16) tail must NOT emit the MX SRD tighten "
+            "banner"
+        )
+        assert not re.search(r"s_sub_u32[^\n]*SrdMXSA\+2", tail), (
+            "Non-MX tail must NOT emit `s_sub_u32 SrdMXSA+2`"
+        )
+        assert not re.search(r"s_sub_u32[^\n]*SrdMXSB\+2", tail), (
+            "Non-MX tail must NOT emit `s_sub_u32 SrdMXSB+2`"
+        )
+
+    def test_mx_tighten_fires_for_pgr2_at_depthU_512(self):
+        """The MX tightening must also fire under PGR=2 (the same
+        slot as the bf16 tightener: after `PGRTailEntry<L>:`, before
+        the tail GR). Pins both PGR=0 and PGR=2 emit the helper.
+        """
+        asm = self._emit_fp4_asm(depthU=512, pgr=2)
+        tail = _extract_tail_section(asm)
+        assert tail
+        assert re.search(
+            r"s_sub_u32\s+s\[sgprSrdMXSA\+2\][^\n]*SrdMXSA\+2 -= delta",
+            tail
+        ), (
+            "PGR=2 DepthU=512 fp4 tail must still emit SrdMXSA+2 "
+            "tighten. Tail head:\n" + tail[:2500]
+        )
+        entry_pos = tail.find("PGRTailEntryL:")
+        if entry_pos < 0:
+            entry_pos = tail.find("label_PGRTailEntryL:")
+        srdMXSA_match = re.search(
+            r"s_sub_u32\s+s\[sgprSrdMXSA\+2\][^\n]*SrdMXSA\+2 -= delta",
+            tail)
+        assert entry_pos >= 0 and srdMXSA_match, (
+            "PGR=2 DU=512 tail must have both PGRTailEntryL: label and "
+            "SrdMXSA+2 tighten. tail head:\n" + tail[:2500]
+        )
+        assert entry_pos < srdMXSA_match.start(), (
+            "PGR=2 DU=512 tail must emit MX SRD tighten AFTER "
+            "PGRTailEntryL: so the c=0 / small-counter / large-counter "
+            "paths converge before the tightening fires. entry=%d, "
+            "srdMXSA=%d" % (entry_pos, srdMXSA_match.start())
+        )
