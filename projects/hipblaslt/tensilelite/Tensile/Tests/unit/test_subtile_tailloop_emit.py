@@ -1439,3 +1439,172 @@ class TestTailSrdTightenSubtileMX:
             "paths converge before the tightening fires. entry=%d, "
             "srdMXSA=%d" % (entry_pos, srdMXSA_match.start())
         )
+
+
+# ── Tests: MX data Srd<{A,B}>+2 tightening (DepthU > 256) ─────────────────────
+
+class TestTailSrdTightenSubtileMXData:
+    """`_emitTailSrdTightenSubtileMXData` emit shape.
+
+    Companion to `_emitTailSrdTightenSubtileMX`: where the scale
+    tightener clips `SrdMXS{A,B}+2`, the data tightener clips
+    `Srd{A,B}+2` on the MX **data** tensor side. nakajee #PR-7661
+    review pointed out that the data side needs the same K=256-padded
+    clip as the scale side -- otherwise the natural DepthU-shaped data
+    over-read on the last m-row can fault past the data buffer's
+    allocated bytes (the per-lane-mask + 0-scale absorb keeps the MFMA
+    result correct under garbage data, but garbage reads can still
+    page fault past the data buffer).
+
+    Static gate (must emit nothing): `DepthU <= 256`. The host MX
+    K-padding already covers any K_remain < 256 in that regime, so
+    the helper short-circuits with zero instructions / zero comments.
+
+    Active gate: `DepthU > 256` AND at least one MX side AND
+    non-swizzled MX operand AND bpe in {0.5, 1}. The current MX
+    yamls all use mxfp4/mxfp4 (bpe=0.5 on both sides), so the helper
+    emits a roundUp(K_remain, 256) chain, a single delta_K =
+    DepthU - remainK_MX precompute, ONE `s_lshr_b32 delta, delta, 1`
+    (delta_K * 0.5 = delta_K >> 1), and one `s_sub_u32 Srd{A,B}+2`
+    per MX operand. Swizzled MX operands bail (separate DTV emit
+    path; deferred per nakajee review reply).
+    """
+
+    def _emit_fp4_asm(self, *, depthU, pgr=0):
+        kernel = _create_kernel(256, 256, fp4=True, depthU=depthU,
+                                no_tail_loop=False)
+        _augment_kernel_for_tail_scaffold(kernel, pgr)
+        kwa = _build_minimal_kwa(kernel)
+        tPA = {"is_sparse": False, "tpsMetadata": None}
+        tPB = {"is_sparse": False, "tpsMetadata": None}
+        module = kwa._emitTailLoopScaffoldSubtile(kernel, tPA, tPB)
+        return wrap_with_skiptoend(module)
+
+    def test_mxdata_tighten_static_noop_when_depthU_eq_padK(self):
+        """`DepthU == 256` is the static no-op boundary: every
+        K_remain in [1, 255] rounds up to 256 == DepthU, so
+        delta_K = 0 always. The helper must short-circuit -- no
+        banner, no `Srd{A,B}+2` sub, no temp sgpr alloc.
+        """
+        asm = self._emit_fp4_asm(depthU=256)
+        tail = _extract_tail_section(asm)
+        assert tail, "fp4 fixture must produce a tail body"
+        assert "MX data follow-up" not in tail, (
+            "DepthU=256 must NOT emit the MX data SRD tighten banner"
+        )
+
+    def test_mxdata_tighten_emits_when_depthU_gt_padK(self):
+        """`DepthU=512` (only DepthU>256 fp4 config in our gauntlet)
+        must emit the roundUp chain, the per-MX-operand bpe shift,
+        and per-MX-operand SrdA+2 / SrdB+2 sub.
+
+        Pinned shape (mxfp4 / mxfp4, uniform bpe=0.5 on both sides):
+          banner ("MX data follow-up")
+          s_add_u32  remKMx, LoopCounterL, 255
+          s_and_b32  remKMx, remKMx, 0xffffff00
+          s_sub_u32  delta, 0x200, remKMx
+          s_lshr_b32 delta, delta, 1            # bpe=1/2
+          s_sub_u32  SrdA+2, SrdA+2, delta
+          s_sub_u32  SrdB+2, SrdB+2, delta
+        """
+        asm = self._emit_fp4_asm(depthU=512)
+        tail = _extract_tail_section(asm)
+        assert tail
+        assert "MX data follow-up" in tail, (
+            "DepthU=512 fp4 tail must emit the MX data SRD tighten "
+            "banner. Tail head:\n" + tail[:2500]
+        )
+        assert re.search(
+            r"s_add_u32\s+s\[?\d+\]?,\s*s\[sgprLoopCounterL\]\s*,\s*255\b"
+            r"[^\n]*K_remain \+ \(MX_pad_K - 1\)",
+            tail
+        ), "DepthU=512 fp4 tail must add 255 to LoopCounterL for roundUp"
+        assert re.search(
+            r"s_and_b32\s+s\[?\d+\]?,\s*s\[?\d+\]?,\s*0xffffff00\b"
+            r"[^\n]*remainK_MX = roundUp\(K_remain, 256\)",
+            tail
+        ), "DepthU=512 fp4 tail must mask with 0xffffff00 for MX K=256 align"
+        assert re.search(
+            r"s_sub_u32\s+s\[?\d+\]?,\s*(?:512|0x200)\s*,\s*s\[?\d+\]?"
+            r"[^\n]*delta_K = DepthU - remainK_MX",
+            tail
+        ), "DepthU=512 fp4 tail must precompute delta_K = 512 - remainK_MX"
+        # bpe=0.5 → single shr by 1 (uniformShr path)
+        assert re.search(
+            r"s_lshr_b32\s+s\[?\d+\]?,\s*s\[?\d+\]?,\s*0x1\b"
+            r"[^\n]*delta_bytes = delta_K \* bpe_data \(bpe=1/2\)",
+            tail
+        ), (
+            "DepthU=512 fp4 (bpe=0.5) tail must shift delta right by 1 "
+            "to scale K-element delta to bytes"
+        )
+        assert re.search(
+            r"s_sub_u32\s+s\[sgprSrdA\+2\]\s*,\s*s\[sgprSrdA\+2\]"
+            r"\s*,\s*s\[?\d+\]?[^\n]*clip MX data past remainK_MX",
+            tail
+        ), "DepthU=512 fp4 tail must subtract delta from SrdA+2"
+        assert re.search(
+            r"s_sub_u32\s+s\[sgprSrdB\+2\]\s*,\s*s\[sgprSrdB\+2\]"
+            r"\s*,\s*s\[?\d+\]?[^\n]*clip MX data past remainK_MX",
+            tail
+        ), "DepthU=512 fp4 tail must subtract delta from SrdB+2"
+
+    def test_mxdata_tighten_skipped_for_non_mx(self):
+        """Non-MX (bf16) kernels must NOT emit the MX data SRD
+        tighten helper regardless of DepthU.
+        """
+        asm = _emit_tail_loop_asm(fp4=False, no_tail_loop=False, pgr=0)
+        tail = _extract_tail_section(asm)
+        assert tail
+        assert "MX data follow-up" not in tail, (
+            "Non-MX (bf16) tail must NOT emit the MX data SRD tighten "
+            "banner"
+        )
+
+    def test_mxdata_tighten_after_scale_tighten(self):
+        """Emit order at DepthU=512 fp4: the MX **scale** tighten
+        (`MX follow-up`) must precede the MX **data** tighten
+        (`MX data follow-up`); the scaffold call site adds them in
+        scale-then-data order so a refactor that swaps them gets
+        caught here.
+        """
+        asm = self._emit_fp4_asm(depthU=512)
+        tail = _extract_tail_section(asm)
+        assert tail
+        scale_pos = tail.find("MX follow-up")
+        data_pos  = tail.find("MX data follow-up")
+        assert scale_pos >= 0 and data_pos >= 0, (
+            "DepthU=512 fp4 tail must emit BOTH scale and data "
+            "tightener banners; got scale_pos=%d data_pos=%d. "
+            "Tail head:\n%s" % (scale_pos, data_pos, tail[:2500])
+        )
+        assert scale_pos < data_pos, (
+            "MX scale tighten must precede MX data tighten in the "
+            "scaffold (got scale=%d, data=%d)" % (scale_pos, data_pos)
+        )
+
+    def test_mxdata_tighten_fires_for_pgr2_at_depthU_512(self):
+        """The MX data tightening must also fire under PGR=2, in the
+        same slot as the scale tightener (after `PGRTailEntry<L>:`,
+        before the tail GR). Mirrors the scale-side PGR2 pin.
+        """
+        asm = self._emit_fp4_asm(depthU=512, pgr=2)
+        tail = _extract_tail_section(asm)
+        assert tail
+        entry_pos = tail.find("PGRTailEntryL:")
+        if entry_pos < 0:
+            entry_pos = tail.find("label_PGRTailEntryL:")
+        data_match = re.search(
+            r"s_sub_u32\s+s\[sgprSrdA\+2\]\s*,\s*s\[sgprSrdA\+2\]"
+            r"\s*,\s*s\[?\d+\]?[^\n]*clip MX data past remainK_MX",
+            tail
+        )
+        assert entry_pos >= 0 and data_match, (
+            "PGR=2 DU=512 fp4 tail must have BOTH PGRTailEntryL: label "
+            "and SrdA+2 MX-data tighten. Tail head:\n" + tail[:2500]
+        )
+        assert entry_pos < data_match.start(), (
+            "PGR=2 DU=512 fp4 must emit MX data SRD tighten AFTER "
+            "PGRTailEntryL: (entry=%d, srdA-data=%d)"
+            % (entry_pos, data_match.start())
+        )

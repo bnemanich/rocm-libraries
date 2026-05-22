@@ -36,7 +36,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB192, BufferLoadB32, Bu
   DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB192, FlatLoadB32, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, MXMFMAInstruction, SAddU32, SAddCU32, SAndB32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpGeU32, SCmpLeU32, SCmpLtU32, \
-  SLShiftLeftB32, SMFMAInstruction, SNop, SEndpgm, SSetPrior, SSetRegIMM32B32, SSubBU32, SSubU32, SWaitCnt, SWaitAlu, \
+  SLShiftLeftB32, SLShiftRightB32, SMFMAInstruction, SNop, SEndpgm, SSetPrior, SSetRegIMM32B32, SSubBU32, SSubU32, SWaitCnt, SWaitAlu, \
   SLongBranchPositive, VAddU32, VCmpEQI32, VCmpGEI32, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VNop, Instruction
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
@@ -4597,6 +4597,144 @@ class KernelWriter(metaclass=abc.ABCMeta):
           comment="Srd%s+2 -= delta (clip K past remainK_MX)" % tc))
     return module
 
+  def _emitTailSrdTightenSubtileMXData(self, kernel):
+    """Tighten `Srd{A,B}+2` (buffer NumRecords) at tail entry for the
+    MX **data** tensors when `DepthU > MX_PAD_K` (=256). Companion to
+    `_emitTailSrdTightenSubtileMX` which clips `SrdMXS{A,B}+2`;
+    nakajee #PR-7661 review pointed out that the data-side SRD needs
+    the same K=256-padded clip so the natural DepthU-shaped data
+    over-read on the last m-row cannot fault past the data tensor's
+    allocated bytes (the per-lane-mask + 0-scale absorb keeps results
+    correct even with garbage data, but garbage reads can still page
+    fault if they spill past the data buffer's last byte).
+    Per-nakajee spec:
+      remainK_MX = roundUp(K_remain, 256)                # K elements
+      delta_K    = DepthU - remainK_MX                   # K elements, >= 0
+      Srd{A,B}+2 -= delta_K * bpe_data                   # bytes
+
+    Static gate -- emit nothing when `DepthU <= MX_PAD_K=256`:
+      For any K_remain in [0, DepthU-1] with DepthU <= 256,
+      `remainK_MX = roundUp(K_remain, 256) >= DepthU` (and the tail
+      loop doesn't fire on K_remain=0), so `delta_K <= 0`. The host
+      MX padding alone already covers any data over-read.
+
+    For MX BF/FP4 / FP8 the per-K-element data bpe is 0.5 / 1
+    respectively; both can be expressed as `bpe = 1 / (1 << shr)`
+    with `shr in {0, 1}` (fp8: shr=0; fp4: shr=1). The delta-bytes
+    SShiftRight is therefore a fixed compile-time shift.
+
+    Why a separate helper (vs sharing the bf16 `_emitTailSrdTightenSubtile`
+    or extending the MX scale `_emitTailSrdTightenSubtileMX`): the
+    bf16 path uses `bpe in {1, 2}` (integer) and bpr=4 alignment; the
+    MX data path needs fractional bpe (0.5 for fp4) and K=256
+    alignment. Sharing would require parameterizing every step; two
+    small focused helpers are easier to reason about. We co-locate
+    the MX-scale and MX-data tighteners in the scaffold call sequence.
+
+    No SRD restore is needed: the tail GR is the last read site for
+    A/B data before the kernel epilogue.
+
+    Gated to:
+      - at least one MX side present (`MXBlockA > 0` OR `MXBlockB > 0`),
+      - non-swizzled A/B on the MX sides we tighten (SwizzleTensor{A,B}
+        on the MX operand bails -- swizzle adds a per-block stride
+        that the simple `delta_K * bpe` formula does not model;
+        nakajee comment 3286926937 notes swizzle support is deferred),
+      - `DepthU > 256` (otherwise static no-op),
+      - per-MX-operand bpe in {0.5, 1} (fp4 / fp8; the only data dtypes
+        used with MXBlock today).
+    """
+    module = Module("tailSrdTightenSubtileMXData")
+    hasMxA = kernel["ProblemType"].get("MXBlockA", 0) > 0
+    hasMxB = kernel["ProblemType"].get("MXBlockB", 0) > 0
+    if not (hasMxA or hasMxB):
+      return module
+    MX_PAD_K = 256
+    depthU = int(kernel["DepthU"])
+    if depthU <= MX_PAD_K:
+      return module
+    # Build (tc, ti, shr) tuples for each MX-present operand whose
+    # data side is non-swizzled and whose bpe maps to a clean
+    # SShiftRightB32. `bpe = 1.0 / (1 << shr)` for shr in {0, 1}.
+    def _bpeShiftRight(bpe):
+      if bpe >= 1.0 and abs(bpe - int(bpe)) < 1e-9:
+        # bpe=1: no shift; bpe=2/4/...: shift LEFT (would need a
+        # different code path -- MX data is never bpe > 1 today, so
+        # bail rather than emit dead branches).
+        return 0 if int(bpe) == 1 else None
+      inv = 1.0 / bpe
+      if abs(inv - int(round(inv))) > 1e-9:
+        return None
+      inv = int(round(inv))
+      if inv <= 0 or (inv & (inv - 1)) != 0:
+        return None
+      shr = inv.bit_length() - 1
+      return shr
+    mxOperands = []
+    if hasMxA:
+      if kernel["ProblemType"].get("SwizzleTensorA", False):
+        return module
+      shrA = _bpeShiftRight(float(self.states.a.tileInfo.bpe))
+      if shrA is None:
+        return module
+      mxOperands.append(('A', shrA))
+    if hasMxB:
+      if kernel["ProblemType"].get("SwizzleTensorB", False):
+        return module
+      shrB = _bpeShiftRight(float(self.states.b.tileInfo.bpe))
+      if shrB is None:
+        return module
+      mxOperands.append(('B', shrB))
+    if not mxOperands:
+      return module
+
+    module.addComment2(
+      "Tighten Srd<tc>+2 for MX data K_remain (MX K-pad=%u, DepthU=%u; "
+      "nakajee #PR-7661 OOR review MX data follow-up)" % (MX_PAD_K, depthU))
+    with self.allocTmpSgpr(2) as tmpInfo:
+      remKMx = tmpInfo.idx
+      delta = tmpInfo.idx + 1
+      padMaskInv = (~(MX_PAD_K - 1)) & 0xffffffff
+      module.add(SAddU32(
+        dst=sgpr(remKMx), src0=sgpr("LoopCounterL"), src1=(MX_PAD_K - 1),
+        comment="K_remain + (MX_pad_K - 1) for roundUp"))
+      module.add(SAndB32(
+        dst=sgpr(remKMx), src0=sgpr(remKMx), src1=hex(padMaskInv),
+        comment="remainK_MX = roundUp(K_remain, %u)" % MX_PAD_K))
+      module.add(SSubU32(
+        dst=sgpr(delta), src0=depthU, src1=sgpr(remKMx),
+        comment="delta_K = DepthU - remainK_MX (>= 0)"))
+      # If both A and B share the same shr (the common
+      # mxfp4/mxfp4 and mxfp8/mxfp8 cases) we shift once and SSub both
+      # SRDs from the same delta_bytes; mixed shr falls back to a
+      # per-operand SSub with its own shifted temporary so the
+      # delta_bytes scale stays per-operand-correct.
+      uniformShr = mxOperands[0][1] if all(s == mxOperands[0][1] for _, s in mxOperands) else None
+      if uniformShr is not None:
+        if uniformShr > 0:
+          module.add(SLShiftRightB32(
+            dst=sgpr(delta), src=sgpr(delta), shiftHex=hex(uniformShr),
+            comment="delta_bytes = delta_K * bpe_data (bpe=1/%u)" % (1 << uniformShr)))
+        for tc, _ in mxOperands:
+          module.add(SSubU32(
+            dst=sgpr("Srd%s+2" % tc), src0=sgpr("Srd%s+2" % tc), src1=sgpr(delta),
+            comment="Srd%s+2 -= delta (clip MX data past remainK_MX)" % tc))
+      else:
+        # Mixed bpe across A and B is not currently realized in any
+        # gauntlet config; emit a per-operand path for completeness.
+        for tc, shr in mxOperands:
+          if shr > 0:
+            module.add(SLShiftRightB32(
+              dst=sgpr(remKMx), src=sgpr(delta), shiftHex=hex(shr),
+              comment="Srd%s delta_bytes = delta_K * bpe_data (bpe=1/%u)" % (tc, 1 << shr)))
+            srcDelta = remKMx
+          else:
+            srcDelta = delta
+          module.add(SSubU32(
+            dst=sgpr("Srd%s+2" % tc), src0=sgpr("Srd%s+2" % tc), src1=sgpr(srcDelta),
+            comment="Srd%s+2 -= delta (clip MX data past remainK_MX)" % tc))
+    return module
+
   def _emitTailSubLaneMaskRefineSubtile(self, kernel, kPosBaseVgpr, mmak, miK,
                                         numMIInUnroll, aIndicesByIr, bIndicesByIr):
     """Sub-lane K-tail mask refinement: zero past-LoopCounterL bytes
@@ -5157,6 +5295,14 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # see `_emitTailSrdTightenSubtileMX` for formula and gating
       # (statically no-op for DepthU <= 256, the host MX-pad unit).
       module.add(self._emitTailSrdTightenSubtileMX(kernel))
+      # MX data SRD tightening (SrdA / SrdB on MX kernels) when
+      # DepthU > 256; nakajee #PR-7661 review pointed out that the
+      # data-side SRD needs the same K=256-padded clip as the scale
+      # side (the per-lane mask + 0-scale absorb keeps results
+      # correct under garbage data, but garbage reads can still page
+      # fault past the data buffer). See `_emitTailSrdTightenSubtileMXData`
+      # for formula and gating (statically no-op for DepthU <= 256).
+      module.add(self._emitTailSrdTightenSubtileMXData(kernel))
 
       # No SRD rewind here. For PGR=0 the mainloop's per-iter GR_INC
       # leaves Srd<tc> at the K-tail's first byte after K//DU iters,
