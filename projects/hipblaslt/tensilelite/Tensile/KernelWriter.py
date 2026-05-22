@@ -4350,22 +4350,38 @@ class KernelWriter(metaclass=abc.ABCMeta):
     nakajee's OOR review (PR #7661 carried forward from PR #7636
     "Comment 5" TODO at the tail GR site).
 
-    Formula:
-      alignedBytes = roundUp(LoopCounterL * bpe, loadBytesGR)
+    Formula (nakajee #PR-7661 follow-up: align to bpr=4, not loadBytes):
+      alignedBytes = roundUp(LoopCounterL * bpe, 4)    # bpr=4
       delta_bytes  = DepthU * bpe - alignedBytes
-      Srd<tc>+2   -= delta_bytes        (when delta_bytes > 0)
+      Srd<tc>+2   -= delta_bytes
 
-    `roundUp(..., loadBytesGR)` keeps the load valid for every
-    per-thread `buffer_load_<...>` whose K-range overlaps
-    `[0, K_remain)` -- including the trailing odd-K element on bf16
-    when a single load straddles `K_remain*bpe`. Earlier m-rows are
-    over-protected (their k_lane >= K_remain reads still pass the
+    `roundUp(..., bpr=4)` is the tightest clip nakajee's spec admits
+    that still keeps the wide DTL load valid for the trailing odd-K
+    element on the last m-row: per-thread `buffer_load_<...>` is a
+    BufferLoad-aligned hardware multiple of bpr, so the smallest
+    granularity past K_remain that the load *needs* to cover is one
+    bpr-worth of bytes (=2 bf16 / 4 int8 elements). Earlier m-rows
+    are over-protected (their k_lane >= K_remain reads still pass the
     tightened limit but get zeroed in VGPR by the per-MFMA lane
     mask + sub-lane refine, so correctness is unchanged).
 
-    Runtime-clamped: when `alignedBytes >= DepthU*bpe` the natural
-    SRD limit already covers every read and a single `s_cbranch_scc0
-    TailSrdTightenSkip<L>` short-circuits the SSub chain.
+    Align-UP (vs nakajee's literal align-DOWN `remainK & 0xfffffffe`)
+    is required because the gfx950 assembler rejects the narrow
+    trailing-element load (`buffer_load_d16_b16 ... lds`) the
+    align-DOWN strategy depended on; that helper was previously
+    deleted in `7df7d24`. Without it, align-DOWN would drop the
+    trailing odd-K element from the wide load. Our wide DTL + per-lane
+    refine path handles the trailing element when it is INCLUDED in
+    the wide load (which requires align-UP). bpr=4 is the finest
+    align-UP granularity, trading nakajee's tightest possible clip
+    for at most one DWORD (4 B = 2 bf16) of slack. Tensilelite always
+    K-pads to MIK boundary, so DWORD-level past-K reads stay
+    within-page.
+
+    `delta_bytes >= 0` is provably non-negative under align-UP to
+    bpr=4 (alignedBytes <= roundUp((DepthU-1)*bpe, 4) <= DepthU*bpe
+    for bpe in {1, 2}), so no runtime clamp / skip-label is needed
+    -- when delta=0 the two `s_sub_u32` lines become harmless no-ops.
 
     Gating (the helper is only called from
     `_emitTailLoopScaffoldSubtile`, which already runs only for
@@ -4374,12 +4390,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
     out-of-scope subtile variants):
       - non-MX (`MXBlock{A,B} == 0`) -- MX scales have their own
         host re-scatter padding (`DataInitialization.cpp`
-        `rearrangePaddedMXScaleLayout`); MX data + MXSA/MXSB SRD
-        tightening uses the swizzleBlock-aware formula from
-        nakajee's spec and is a follow-up;
+        `rearrangePaddedMXScaleLayout`) plus a separate
+        swizzleBlock-aware MXSA/MXSB tightener
+        (`_emitTailSrdTightenSubtileMX`) when DepthU > 256;
       - non-swizzled A/B (`SwizzleTensor{A,B}=False`) -- subtile
-        mxfp4 swizzled A/B also need the swizzleBlock formula,
-        same follow-up;
+        mxfp4 swizzled A/B (DTV path) live on a different tail-loop
+        emitter entirely;
       - symmetric per-tensor bpe (A and B same dtype), bpe in {1, 2}
         (bf16 / fp16 / int8 anyk paths are the immediate consumer);
       - symmetric per-tensor `loadWidthGR` (per-thread B128 / B64 /
@@ -4407,24 +4423,20 @@ class KernelWriter(metaclass=abc.ABCMeta):
     loadBytesB = int(tiB.loadWidthGR)
     if loadBytesA != loadBytesB or loadBytesA <= 0:
       return module
-    loadBytes = loadBytesA
     depthU = int(kernel["DepthU"])
     depthUBytes = depthU * bpe
-    # `loadBytes` is a hardware load-shape multiple of 4; require
-    # loadBytes <= depthUBytes so `alignedBytes < depthUBytes` is
-    # reachable (otherwise the clamp would always fire).
-    if loadBytes > depthUBytes:
+    # bpr=4 alignment requires depthUBytes >= bpr so the natural
+    # case `K_remain == 0` (which the tail loop doesn't enter, but
+    # is the algebraic boundary) gives delta <= depthUBytes.
+    bpr = 4
+    if depthUBytes < bpr:
       return module
-    # Round-down mask used to align scaledKRem up to a load boundary.
-    loadMaskInv = (~(loadBytes - 1)) & 0xffffffff
-    unrollIdx = self.states.unrollIdx
-    loopChar = self.states.indexChars[
-      kernel["ProblemType"]["IndicesSummation"][unrollIdx]]
-    skipLabel = Label("TailSrdTightenSkip%s" % loopChar, "")
+    # Align-up mask: roundUp(x, bpr) = (x + bpr-1) & ~(bpr-1).
+    alignMaskInv = (~(bpr - 1)) & 0xffffffff
 
     module.addComment2(
-      "Tighten Srd<tc>+2 to K_remain*bpe rounded up to GR load "
-      "granularity (nakajee #PR-7661 OOR review)")
+      "Tighten Srd<tc>+2 to K_remain*bpe rounded up to bpr=4 "
+      "(nakajee #PR-7661 OOR review follow-up)")
     with self.allocTmpSgpr(2) as tmpInfo:
       scaledKRem = tmpInfo.idx
       delta = tmpInfo.idx + 1
@@ -4437,32 +4449,25 @@ class KernelWriter(metaclass=abc.ABCMeta):
         module.add(SMovB32(
           dst=sgpr(scaledKRem), src=sgpr("LoopCounterL"),
           comment="K_remain * bpe (bpe=1)"))
-      # scaledKRem = roundUp(scaledKRem, loadBytes)
+      # scaledKRem = roundUp(scaledKRem, bpr)
       module.add(SAddU32(
-        dst=sgpr(scaledKRem), src0=sgpr(scaledKRem), src1=(loadBytes - 1),
-        comment="+ (loadBytes-1) for roundUp"))
+        dst=sgpr(scaledKRem), src0=sgpr(scaledKRem), src1=(bpr - 1),
+        comment="+ (bpr-1) for roundUp"))
       module.add(SAndB32(
-        dst=sgpr(scaledKRem), src0=sgpr(scaledKRem), src1=hex(loadMaskInv),
-        comment="alignedBytes = roundUp(K_remain*bpe, %u)" % loadBytes))
-      # Skip when alignedBytes >= depthUBytes -- natural limit already
-      # tight; SSub would underflow or no-op.
-      module.add(SCmpLtU32(
-        src0=sgpr(scaledKRem), src1=depthUBytes,
-        comment="alignedBytes < DepthU*bpe?"))
-      module.add(SCBranchSCC0(
-        labelName=skipLabel.getLabelName(),
-        comment="natural SRD already tight; skip SRD tighten"))
-      # delta = depthUBytes - alignedBytes (positive)
+        dst=sgpr(scaledKRem), src0=sgpr(scaledKRem), src1=hex(alignMaskInv),
+        comment="alignedBytes = roundUp(K_remain*bpe, %u)" % bpr))
+      # delta = depthUBytes - alignedBytes (provably >= 0 under
+      # align-UP to bpr=4; when delta=0 the SSubs are harmless
+      # no-ops, so no runtime cbranch/skip-label needed).
       module.add(SSubU32(
         dst=sgpr(delta), src0=depthUBytes, src1=sgpr(scaledKRem),
-        comment="delta = DepthU*bpe - alignedBytes"))
+        comment="delta = DepthU*bpe - alignedBytes (>= 0)"))
       module.add(SSubU32(
         dst=sgpr("SrdA+2"), src0=sgpr("SrdA+2"), src1=sgpr(delta),
         comment="Srd A+2 -= delta (clip K past K_remain on last m-row)"))
       module.add(SSubU32(
         dst=sgpr("SrdB+2"), src0=sgpr("SrdB+2"), src1=sgpr(delta),
         comment="Srd B+2 -= delta (clip K past K_remain on last m-row)"))
-      module.add(skipLabel)
     return module
 
   def _emitTailSubLaneMaskRefineSubtile(self, kernel, kPosBaseVgpr, mmak, miK,
