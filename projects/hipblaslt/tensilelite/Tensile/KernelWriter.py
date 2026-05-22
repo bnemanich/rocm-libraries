@@ -5372,8 +5372,24 @@ class KernelWriter(metaclass=abc.ABCMeta):
         # instead of the full A/B vgprTiles range.
         aMmakSlice = tiA.allocVgprTileRegistersForMmak(self, kernel, mmak)
         bMmakSlice = tiB.allocVgprTileRegistersForMmak(self, kernel, mmak)
-        module.add(emitSubtileDsReadForMmak('A', self, kernel, mmak))
-        module.add(emitSubtileDsReadForMmak('B', self, kernel, mmak))
+        # Per-mmak ds_read slice (mmak -> (sId1, du)):
+        #   sId1   = mmak // subtileShape[1]
+        #   du     = mmak %  subtileShape[1]
+        #   mfmaId = getSubtileShapeLinearId(du, 0)
+        # Loops sId0 over the operand's M-axis local subtile grid and
+        # emits one DS load per (sId0, sId1, du). Inlined here (vs a
+        # separate `emitSubtileDsReadForMmak` helper) per sebvince
+        # #PR-7661 review -- the iteration shape is tail-scaffold-
+        # specific and the only consumer is this site.
+        for tc, ti in (('A', tiA), ('B', tiB)):
+          subKShape = ti.subtileShape[1]
+          sId1     = mmak // subKShape
+          du       = mmak %  subKShape
+          mfmaId   = ti.getSubtileShapeLinearId(du, 0)
+          for sId0 in range(ti.localSubtileGrid[0]):
+            tileIdx = ti.lrTileIndexForSubtile(sId0, sId1, mfmaId)
+            dstTile = ti.vgprTiles[tileIdx]
+            module.add(emitSingleDsRead(ti, sId0, sId1, du, dstTile))
         module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1,
                             comment="tail LR mmak=%u: wait for ds_reads before lane mask + MFMA" % mmak))
 

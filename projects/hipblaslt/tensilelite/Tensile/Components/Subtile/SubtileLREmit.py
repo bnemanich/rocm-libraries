@@ -552,39 +552,6 @@ def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
   return module
 
 
-def emitSubtileDsReadForMmak(tc, writer, kernel, mmak):
-  """Emit ds_read instructions for ONLY the K-slice owned by `mmak`.
-
-  The full-grid `localReadDoSubtile` emits ds_reads for every
-  (sId0, sId1, du) tuple up front; the tail scaffold's per-mmak
-  interleave instead drives one slice at a time so the destination
-  vgprTiles can be allocated / freed per mmak (peak VGPR pressure
-  falls from `vgprTiles_total` to one slice's worth — for
-  MT320x288x64 BF16 from 184 to 92 VGPRs across A+B).
-
-  The `mmak`-th K-slice maps to (sId1, du) = (mmak // ss[1],
-  mmak % ss[1]) where ss is the LR subtile shape; the slice spans
-  `localSubtileGrid[0]` rows along M (sId0 ∈ [0, localSubtileGrid[0])).
-
-  Pre-condition: `tileInfo.vgprTiles[tileIdx]` must already hold
-  allocated VGPRs for every (sId0, sId1, du) in the slice — see
-  `TileInfo.allocVgprTileRegistersForMmak`.
-  """
-  module = Module()
-  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
-
-  subKShape = tileInfo.subtileShape[1]
-  sId1 = mmak // subKShape
-  du = mmak % subKShape
-
-  for sId0 in range(tileInfo.localSubtileGrid[0]):
-    mfmaId = tileInfo.getSubtileShapeLinearId(du, 0)
-    tileIdx = tileInfo.lrTileIndexForSubtile(sId0, sId1, mfmaId)
-    dstTile = tileInfo.vgprTiles[tileIdx]
-    module.add(emitSingleDsRead(tileInfo, sId0, sId1, du, dstTile))
-
-  return module
-
 ##################################################
 # Subroutine to generate LR load code
 # Initial idea: maybe store asm in modules in a separate obj?
