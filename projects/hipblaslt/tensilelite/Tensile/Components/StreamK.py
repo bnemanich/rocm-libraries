@@ -373,6 +373,35 @@ class StreamK(Component):
         module.add(SMinU32(dst=sgpr("StreamKLocalEnd"), src0=sgpr("StreamKIterEnd"), src1=sgpr(sTmp+2), comment="1. (Local) iteration end (SK tile)"))
         module.add(SSubU32(dst=sgpr("StreamKLocalEnd"), src0=sgpr("StreamKLocalEnd"), src1=sgpr(sTmp+1), comment="2. Local iteration end (SK tile)"))
 
+        # Subtile MX path: align partition boundaries to multiples of R =
+        # DepthUMX/DepthU.  The kernel's R-period scale-fetch scheduler and
+        # the gate_last_iter scale-GR strip assume each WG's partial-K span
+        # is a whole number of R-periods.  When the host's StreamK partition
+        # gives a WG an SLS or SLE that is not R-aligned (e.g. odd partition
+        # span at K/DUMX=odd on MT256x256), the WG's last MFMA reads stale
+        # scale data and the wave-0/subtile-0/elem_n=0 accumulator blows up
+        # to bf16-saturation NaN-class on deep K.
+        #
+        # We round both SLS and SLE *up* to the next multiple of R.  All
+        # WGs apply the same rule, so consecutive WGs' rounded boundaries
+        # still meet (round_up(SLE_i) == round_up(SLS_{i+1})), every body
+        # iter in [0, ItersPerTile) is owned by exactly one WG, and total
+        # work per tile is preserved.  ItersPerTile is always a multiple of
+        # R (AssertSummationElementMultiple = R*DepthU), so rounded SLE
+        # never exceeds ItersPerTile and the first WG's rounded SLS stays
+        # at 0.  R==1 is a strict no-op.
+        _duMX = int(kernel.get("DepthUMX", 0))
+        if kernel.get("UseSubtileImpl") and _duMX > 0:
+            _R = _duMX // kernel["DepthU"]
+            if _R > 1:
+                assert (_R & (_R - 1)) == 0, \
+                    "DepthUMX/DepthU (R=%u) must be power of 2 for SK R-period alignment" % _R
+                mask = hex((~(_R - 1)) & 0xFFFFFFFF)
+                module.add(SAddU32(dst=sgpr("StreamKLocalStart"), src0=sgpr("StreamKLocalStart"), src1=_R-1, comment="SubtileImpl-MX SK partial-K: round SLS up to R=%u-period"%_R))
+                module.add(SAndB32(dst=sgpr("StreamKLocalStart"), src0=sgpr("StreamKLocalStart"), src1=mask, comment="align SLS to R=%u"%_R))
+                module.add(SAddU32(dst=sgpr("StreamKLocalEnd"), src0=sgpr("StreamKLocalEnd"), src1=_R-1, comment="SubtileImpl-MX SK partial-K: round SLE up to R=%u-period"%_R))
+                module.add(SAndB32(dst=sgpr("StreamKLocalEnd"), src0=sgpr("StreamKLocalEnd"), src1=mask, comment="align SLE to R=%u"%_R))
+
         return module
 
     def skIndexToWG(self, writer, kernel, sTmp):
