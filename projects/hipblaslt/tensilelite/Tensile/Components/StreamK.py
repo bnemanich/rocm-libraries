@@ -872,6 +872,29 @@ class StreamK(Component):
                 writer.releaseStreamKConstSgpr(sIpt)
                 module.add(SSubU32(dst=sgpr(sFixupEnd), src0=sgpr("StreamKIterEnd"), src1=sgpr(tmpSgpr), comment="calc iterations completed by this WG"))
 
+                # Subtile MX path: 3a4501c9ea0 rounded StreamKLocalStart/End up to
+                # multiples of R inside the kernel.  The fixup loop's cumulative
+                # tracker `sFixupEnd` was still initialized from the host-supplied
+                # un-rounded `StreamKIterEnd`, and was advanced by the un-rounded
+                # `SKItersPerWG` (or +1 for extras WGs) at each step.  For deep K
+                # (gates A/B) the rounding delta is bounded by R-1 = 1 iter out of
+                # thousands so the cumulative drift was harmless; for small K with
+                # non-pow-2 MIWT and odd `SKItersPerWG` (e.g. mt192x256_plr1_wgm4
+                # at K=512 / K=3328) the per-step delta is a non-negligible
+                # fraction of the total span and the un-rounded tracker drifts
+                # away from each WG's actual rounded SLE boundary.  Round up here
+                # so each cumulative step lands on the kernel's rounded SLE.
+                # R == 1 path is a strict no-op.
+                _duMX_fix = int(kernel.get("DepthUMX", 0))
+                _useFixupRound = bool(kernel.get("UseSubtileImpl") and _duMX_fix > 0)
+                _R_fix = (_duMX_fix // kernel["DepthU"]) if _useFixupRound else 1
+                if _useFixupRound and _R_fix > 1:
+                    assert (_R_fix & (_R_fix - 1)) == 0, \
+                        "DepthUMX/DepthU (R=%u) must be power of 2 for SK fixup-loop R-period alignment" % _R_fix
+                    _maskR_fix = hex((~(_R_fix - 1)) & 0xFFFFFFFF)
+                    module.add(SAddU32(dst=sgpr(sFixupEnd), src0=sgpr(sFixupEnd), src1=_R_fix-1, comment="SubtileImpl-MX SK fixup: round sFixupEnd up to R=%u-period"%_R_fix))
+                    module.add(SAndB32(dst=sgpr(sFixupEnd), src0=sgpr(sFixupEnd), src1=_maskR_fix, comment="align sFixupEnd to R=%u"%_R_fix))
+
                 module.add(skFixupLabel)
 
                 # Check flag
@@ -938,6 +961,9 @@ class StreamK(Component):
                     module.add(SCmpLtU32(src0=sgpr(sCtaIdx), src1=sgpr(sSkExtraIters), comment="Check if next WG had an extra iteration"))
                     module.add(SCSelectB32(dst=sgpr(sIterCount), src0=sgpr(sIterCount), src1=sgpr(sIpw), comment="Select correct number of iterations for next WG"))
                     writer.releaseStreamKConstSgpr(sIpw)
+                    if _useFixupRound and _R_fix > 1:
+                        module.add(SAddU32(dst=sgpr(sIterCount), src0=sgpr(sIterCount), src1=_R_fix-1, comment="SubtileImpl-MX SK fixup: round step up to R=%u-period"%_R_fix))
+                        module.add(SAndB32(dst=sgpr(sIterCount), src0=sgpr(sIterCount), src1=_maskR_fix, comment="align step to R=%u"%_R_fix))
                     module.add(SAddU32(dst=sgpr(sFixupEnd), src0=sgpr(sFixupEnd), src1=sgpr(sIterCount), comment="next partial tile iteration"))
                     writer.sgprPool.checkIn(sSkExtraIters)
                     writer.sgprPool.checkIn(sIterCount)
@@ -946,7 +972,14 @@ class StreamK(Component):
                     sIpw = writer.acquireStreamKConstSgpr(kernel, "SKItersPerWG")
                     if writer.isStreamKConstantsToVgprEnabled(kernel):
                         module.add(VReadfirstlaneB32(dst=sgpr(sIpw), src=vgpr(writer.states.skConstVgprs["SKItersPerWG"])))
-                    module.add(SAddU32(dst=sgpr(sFixupEnd), src0=sgpr(sFixupEnd), src1=sgpr(sIpw), comment="next partial tile iteration"))
+                    if _useFixupRound and _R_fix > 1:
+                        sIpwTmp = writer.sgprPool.checkOut(1, "ipwRoundTmp")
+                        module.add(SAddU32(dst=sgpr(sIpwTmp), src0=sgpr(sIpw), src1=_R_fix-1, comment="SubtileImpl-MX SK fixup: round SKItersPerWG up to R=%u-period"%_R_fix))
+                        module.add(SAndB32(dst=sgpr(sIpwTmp), src0=sgpr(sIpwTmp), src1=_maskR_fix, comment="align SKItersPerWG step to R=%u"%_R_fix))
+                        module.add(SAddU32(dst=sgpr(sFixupEnd), src0=sgpr(sFixupEnd), src1=sgpr(sIpwTmp), comment="next partial tile iteration (R-rounded)"))
+                        writer.sgprPool.checkIn(sIpwTmp)
+                    else:
+                        module.add(SAddU32(dst=sgpr(sFixupEnd), src0=sgpr(sFixupEnd), src1=sgpr(sIpw), comment="next partial tile iteration"))
                     writer.releaseStreamKConstSgpr(sIpw)
                 sIpt = writer.acquireStreamKConstSgpr(kernel, "ItersPerTile")
                 if writer.isStreamKConstantsToVgprEnabled(kernel):
